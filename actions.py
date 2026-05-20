@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-"""Pella robot action primitives.
+"""Pella's limbs: motor primitives + the action-queue executor.
 
-Each function is async and takes the WebRTC datachannel as its first argument
-so it can be called from within the existing WebRTC event loop in
-front_camera_display.py without opening a second connection.
+The primitives (look_up, sit_look_up, stand_up, wiggle, …) are async
+coroutines that publish sport commands over the Go2 WebRTC data channel.
+They are the leaves of the motion stack — when a higher-level
+task_manager appears (see the project plan), it composes plans and
+eventually emits these primitive names into the action queue.
+
+run_action_consumer is the serializing executor that pops names from
+the queue, dispatches via _ACTION_MAP, and waits for each coroutine to
+finish before starting the next. When the queue drains it queues
+release_control once to clear sticky Euler/Sit state so the joystick
+controls locomotion again.
+
+This module also exposes two small helpers for callers that need to
+peek or filter the queue without consuming it (drain_seek_actions /
+queue_contains) — used by pella_main's interaction state machine.
 """
 
 import asyncio
+from queue import Empty
 
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
 
@@ -15,6 +28,8 @@ from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
 LOOK_UP_PITCH = -0.75
 
 
+# ── Sport command helper ─────────────────────────────────────────────────────
+
 async def _sport(datachannel, cmd: str, **params):
     """Send one sport-mode command over the WebRTC data channel."""
     await datachannel.pub_sub.publish_request_new(
@@ -22,6 +37,8 @@ async def _sport(datachannel, cmd: str, **params):
         {"api_id": SPORT_CMD[cmd], "parameter": params if params else {}},
     )
 
+
+# ── Motion primitives ────────────────────────────────────────────────────────
 
 async def release_control(datachannel):
     """Clear any active pose/velocity target so the joystick controls locomotion again.
@@ -106,3 +123,93 @@ async def dance(datachannel):
     """Dance gesture."""
     await _sport(datachannel, "Dance1")
     print("Action: dance", flush=True)
+
+
+# ── Action dispatch ──────────────────────────────────────────────────────────
+
+ACTION_MAP = {
+    "look_up":     look_up,
+    "look_level":  look_level,
+    "sit_look_up": sit_look_up,
+    "stand_up":    stand_up,
+    "wiggle":      wiggle,
+    "hello":       hello,
+    "dance":       dance,
+}
+
+# Seek-pose actions — used by drain_seek_actions to selectively flush stale
+# seek requests when recognition succeeds while they're still queued.
+SEEK_ACTIONS = ("look_up", "sit_look_up")
+
+
+# ── Action queue helpers ─────────────────────────────────────────────────────
+
+def drain_seek_actions(q):
+    """Remove any pending look_up/sit_look_up from the action queue, preserving
+    the order of the remaining items.
+
+    Called by the interaction state machine when recognition succeeds so stale
+    seek actions queued by a prior seek-timeout don't run after the face has
+    already been found.
+    """
+    keep = []
+    try:
+        while True:
+            item = q.get_nowait()
+            if item not in SEEK_ACTIONS:
+                keep.append(item)
+    except Empty:
+        pass
+    for item in keep:
+        try:
+            q.put_nowait(item)
+        except Exception:
+            pass
+
+
+def queue_contains(q, name):
+    """Best-effort check whether `name` is still pending in the action queue.
+
+    Racy with the consumer running on another thread, but used only for ordering
+    heuristics where a missed/false-positive will self-correct on the next
+    display iteration.
+    """
+    try:
+        return name in list(q.queue)
+    except Exception:
+        return False
+
+
+# ── Action consumer (serializing executor) ───────────────────────────────────
+
+async def run_action_consumer(action_queue, datachannel, stop_event):
+    """Pop action names from `action_queue` and run them one at a time.
+
+    Each name is looked up in ACTION_MAP; the resulting coroutine is awaited
+    to completion before the next item is popped, so e.g. wiggle waits for
+    stand_up to finish instead of running concurrently and being clobbered.
+
+    When an action completes and the queue is empty, release_control runs once
+    to clear any sticky Euler/Sit target — this keeps the joystick responsive
+    after pose-changing actions like look_level. A follow-up action arriving
+    before the queue drains short-circuits the release (no intermediate cleanup
+    between e.g. look_level → wiggle).
+    """
+    action_task = None
+    pending_release = False
+    while not stop_event.is_set():
+        if action_task is None or action_task.done():
+            if action_task is not None and action_task.done():
+                action_task = None
+                pending_release = True
+            try:
+                action_name = action_queue.get_nowait()
+                fn = ACTION_MAP.get(action_name)
+                if fn:
+                    action_task = asyncio.ensure_future(fn(datachannel))
+                    pending_release = False
+            except Empty:
+                if pending_release:
+                    action_task = asyncio.ensure_future(release_control(datachannel))
+                    pending_release = False
+        await asyncio.sleep(0.5)

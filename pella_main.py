@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
-"""Pella: Go2 front camera display with face recognition and voice interaction."""
+"""Pella's brain: orchestrate the eye, mouth, ear, and limbs.
+
+Pella's organs each live in a focused module:
+
+  - front_camera (eye)   — receives WebRTC video frames -> frame_queue
+  - tts          (mouth) — plays text from say_queue via Go2 audiohub
+  - stt          (ear)   — USB-mic VAD + Whisper -> transcript_queue
+  - actions      (limbs) — motor primitives + action_queue executor
+
+This module is the central command center. It owns:
+  - the single Go2 WebRTC connection (shared by eye / mouth / limbs)
+  - the inter-organ queues (frame / say / transcript / action)
+  - the interaction state machine (IDLE -> SEEKING -> RECOGNIZING ->
+    GREETING / INTRODUCING -> COOLDOWN)
+  - the pygame display surface
+  - transcript-driven enrollment handoff
+
+The current state machine corresponds to one task (face interaction).
+Future task_manager (see project plan) will sit above pella_main as a
+peer-orchestrator that emits primitive names into the same action_queue
+and say_queue.
+"""
 
 import asyncio
-import contextlib
-import hashlib
-import io
-import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -27,8 +45,6 @@ import cv2
 import dotenv
 import numpy as np
 import pygame
-import webrtcvad as _webrtcvad
-from pydub import AudioSegment
 
 dotenv.load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 os.environ.setdefault("DISPLAY", ":0")
@@ -41,19 +57,11 @@ from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectio
 from go2_webrtc_driver.webrtc_audiohub import WebRTCAudioHub
 from go2_webrtc_driver.constants import RTC_TOPIC
 
-import re
-
 import actions
+import front_camera
 import stt
-import vision
-from stt import (
-    USE_USB_MIC, TTS_MUTE_SEC, SPEAKER_VOLUME, tts_mute_until,
-    ROBOT_SAMPLE_RATE, ASR_CHANNELS, ASR_SAMPLE_RATE,
-    VAD_AGGRESSIVENESS, VAD_FRAME_MS, VAD_FRAME_SAMPLES,
-    VAD_SPEECH_FRAMES, VAD_SILENCE_FRAMES, VAD_PRE_ROLL_FRAMES,
-    MIN_SPEECH_SEC, MAX_SPEECH_SEC,
-    NOISE_FLOOR_EMA_ALPHA, NOISE_FLOOR_INIT, NOISE_FLOOR_FACTOR, VAD_WARMUP_FRAMES,
-)
+import tts
+from stt import USE_USB_MIC, SPEAKER_VOLUME
 from vision import (
     FACE_DETECT_EVERY, ZOOM_DURATION, GREET_COOLDOWN,
     MOTION_COOLDOWN, SEEK_TIMEOUT,
@@ -63,6 +71,7 @@ from vision import (
     load_recognizer, recognition_worker,
 )
 
+
 # ── Display constants ─────────────────────────────────────────────────────────
 RECONNECT_DELAY        = 5.0
 FRAME_MS               = 20
@@ -70,40 +79,29 @@ TRANSCRIPT_DISPLAY_SEC = 8.0
 TRACKING = "tracking"
 ZOOMED   = "zoomed"
 
+
 # ── Interaction state machine ────────────────────────────────────────────────
-# The interaction state coordinates a single recognition "event" — from the
-# moment a person is spotted, through pose recovery, recognition, and the final
-# greeting / introduction. Previously each branch fired independently per
-# frame, which let recognition flicker between hit/miss trigger a greet
-# immediately followed by an introduce, and let the greet branch run while the
-# robot was still seated. The state machine forces these to happen as one
-# coherent sequence.
-INTERACTION_IDLE         = "idle"          # listening for motion / face
-INTERACTION_SEEKING      = "seeking"       # adjusting pose to find a face
-INTERACTION_RECOGNIZING  = "recognizing"   # complete face visible; voting on identity
-INTERACTION_GREETING     = "greeting"      # known person — recovery + say + wiggle
-INTERACTION_INTRODUCING  = "introducing"   # unknown — ask name; enrollment runs
-INTERACTION_COOLDOWN     = "cooldown"      # grace period before re-engaging
+INTERACTION_IDLE         = "idle"
+INTERACTION_SEEKING      = "seeking"
+INTERACTION_RECOGNIZING  = "recognizing"
+INTERACTION_GREETING     = "greeting"
+INTERACTION_INTRODUCING  = "introducing"
+INTERACTION_COOLDOWN     = "cooldown"
 
 # Recognition is debounced across multiple detection cycles so a single
-# misrecognition doesn't drive a wrong greeting/introduction. With
-# FACE_DETECT_EVERY=5 at ~30 fps, one observation arrives every ~170 ms, so
-# 3 observations yields a decision in ~0.5 s.
+# misrecognition doesn't drive a wrong greeting/introduction. At ~6 detection
+# cycles per second, 3 observations yields a decision in ~0.5 s.
 RECOG_VOTES_REQUIRED    = 3
 RECOG_AGREE_MIN         = 2
 RECOG_TIMEOUT_SEC       = 6.0
-# After a recovery action (look_level / stand_up) is queued, give the body
-# this long to stop moving before we start sampling faces for the verdict.
-# Frames captured mid-motion are too blurry for enrollment and produce
-# spurious "unknown" votes that contaminate the verdict.
-# look_level is a quick body-tilt back to level (~1 s covers it). stand_up
-# from sit is a full rise — leg unfold + balance — and runs noticeably
-# longer, so its stabilization needs to wait out the whole motion before
-# any face is sampled.
+# Look_level is a quick body-tilt back to level (~0.5 s covers it). stand_up
+# from sit is a full rise — leg unfold + balance — and runs noticeably longer,
+# so its stabilization needs to wait out the whole motion before any face is
+# sampled. With the seek pose now held throughout RECOGNIZING (recovery is
+# queued at RECOGNIZING exit), these durations target the time before we start
+# sampling — i.e. how long we let the body settle in the seek pose first.
 RECOG_STABILIZE_LOOK_SEC = 0.5
 RECOG_STABILIZE_SIT_SEC  = 1.5
-# Face position jitters during pose recovery, so individual detections can miss
-# even when the person is visible. Allow brief gaps before declaring face lost.
 FACE_LOST_TIMEOUT_SEC   = 3.0
 GREETING_DURATION_SEC   = 6.0
 INTERACTION_COOLDOWN_SEC = 5.0
@@ -124,51 +122,6 @@ def _tally_recognition(obs):
     if count < RECOG_AGREE_MIN:
         return None, "ambiguous"
     return val, ("known" if val else "unknown")
-
-
-# ── TTS helpers ───────────────────────────────────────────────────────────────
-
-def _generate_wav(text: str, text_hash: str) -> str:
-    """Convert text to a 44100 Hz WAV via gTTS. Returns the file path."""
-    from gtts import gTTS
-    mp3_path = f"/tmp/pella_{text_hash}.mp3"
-    out_path = f"/tmp/pella_{text_hash}.wav"
-    gTTS(text=text, lang="en").save(mp3_path)
-    sound = AudioSegment.from_mp3(mp3_path).set_frame_rate(44100)
-    sound.export(out_path, format="wav")
-    os.unlink(mp3_path)
-    return out_path
-
-
-# ── Display helpers ───────────────────────────────────────────────────────────
-
-def _to_surface(bgr: np.ndarray, size: tuple) -> pygame.Surface:
-    rgb  = bgr[:, :, ::-1]
-    surf = pygame.image.frombuffer(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), "RGB")
-    return pygame.transform.scale(surf, size)
-
-
-def _make_offline_surface(w: int, h: int) -> pygame.Surface:
-    surf = pygame.Surface((w, h))
-    surf.fill((0, 0, 0))
-    font = pygame.font.SysFont("sans", 36)
-    text = font.render("Waiting for Pella...", True, (180, 180, 180))
-    surf.blit(text, (w // 2 - text.get_width() // 2, h // 2))
-    return surf
-
-
-def _draw_transcript(screen, font, text: str, w: int, h: int):
-    """Render transcript text centred at the bottom of the screen."""
-    padding = 12
-    surf  = font.render(text, True, (255, 255, 0))
-    bg_w  = surf.get_width()  + padding * 2
-    bg_h  = surf.get_height() + padding * 2
-    bg    = pygame.Surface((bg_w, bg_h), pygame.SRCALPHA)
-    bg.fill((0, 0, 0, 160))
-    x = (w - bg_w) // 2
-    y = h - bg_h - 30
-    screen.blit(bg, (x, y))
-    screen.blit(surf, (x + padding, y + padding))
 
 
 # ── Name parsing ─────────────────────────────────────────────────────────────
@@ -226,235 +179,79 @@ def _parse_name(text: str) -> str:
     return " ".join(words)
 
 
-_SEEK_ACTIONS = ("look_up", "sit_look_up")
+# ── Display helpers ───────────────────────────────────────────────────────────
+
+def _to_surface(bgr: np.ndarray, size: tuple) -> pygame.Surface:
+    rgb  = bgr[:, :, ::-1]
+    surf = pygame.image.frombuffer(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), "RGB")
+    return pygame.transform.scale(surf, size)
 
 
-def _drain_seek_actions(q):
-    """Remove any pending look_up/sit_look_up from the action queue, preserving order
-    of the remaining items. Called when recognition succeeds so stale seek actions
-    queued by a prior seek-timeout don't run after the face has already been found.
-    """
-    keep = []
-    try:
-        while True:
-            item = q.get_nowait()
-            if item not in _SEEK_ACTIONS:
-                keep.append(item)
-    except Empty:
-        pass
-    for item in keep:
+def _make_offline_surface(w: int, h: int) -> pygame.Surface:
+    surf = pygame.Surface((w, h))
+    surf.fill((0, 0, 0))
+    font = pygame.font.SysFont("sans", 36)
+    text = font.render("Waiting for Pella...", True, (180, 180, 180))
+    surf.blit(text, (w // 2 - text.get_width() // 2, h // 2))
+    return surf
+
+
+def _draw_transcript(screen, font, text: str, w: int, h: int):
+    """Render transcript text centred at the bottom of the screen."""
+    padding = 12
+    surf  = font.render(text, True, (255, 255, 0))
+    bg_w  = surf.get_width()  + padding * 2
+    bg_h  = surf.get_height() + padding * 2
+    bg    = pygame.Surface((bg_w, bg_h), pygame.SRCALPHA)
+    bg.fill((0, 0, 0, 160))
+    x = (w - bg_w) // 2
+    y = h - bg_h - 30
+    screen.blit(bg, (x, y))
+    screen.blit(surf, (x + padding, y + padding))
+
+
+# ── Robot connection lifecycle ───────────────────────────────────────────────
+
+def _make_gpt_feedback_handler(transcript_queue):
+    """Build a callback for the robot's onboard chat_go ASR pub/sub topic."""
+    def _on_gpt_feedback(msg):
+        import json
         try:
-            q.put_nowait(item)
+            inner = msg.get("data") or msg
+            if isinstance(inner, str):
+                inner = json.loads(inner)
+            text = (inner.get("text") or inner.get("asr_result")
+                    or inner.get("result") or "")
         except Exception:
-            pass
-
-
-def _queue_contains(q, name):
-    """Best-effort check whether `name` is still pending in the action queue.
-    Racy with the consumer thread, but used only for ordering heuristics where
-    a missed/false-positive will self-correct on the next display iteration.
-    """
-    try:
-        return name in list(q.queue)
-    except Exception:
-        return False
-
-
-# ── WebRTC thread ─────────────────────────────────────────────────────────────
-
-_ACTION_MAP = {
-    "look_up":     actions.look_up,
-    "look_level":  actions.look_level,
-    "sit_look_up": actions.sit_look_up,
-    "stand_up":    actions.stand_up,
-    "wiggle":      actions.wiggle,
-    "hello":       actions.hello,
-    "dance":       actions.dance,
-}
-
-
-def _run_webrtc(robot_ip: str, frame_queue: Queue, say_queue: Queue,
-                transcript_queue: Queue, action_queue: Queue,
-                stop_event: threading.Event, enable_audio: bool = True):
-    """Connect to the robot, stream video, play TTS, and (optionally) do STT.
-
-    enable_audio=False when the USB mic handles STT instead.
-    The WebRTC connection remains active for video and TTS regardless.
-    """
-
-    async def recv_video(track):
-        while not stop_event.is_set():
-            try:
-                frame = await track.recv()
-                img = frame.to_ndarray(format="bgr24")
-                while frame_queue.qsize() > 2:
-                    try:
-                        frame_queue.get_nowait()
-                    except Empty:
-                        break
-                frame_queue.put(img)
-            except Exception as e:
-                print(f"recv_video error: {type(e).__name__}: {e}", flush=True)
-                break
-
-    async def _speak(text: str, audiohub, cache: dict):
-        """Generate WAV on demand and play it via the robot's AudioHub."""
-        try:
-            text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
-            file_name = f"pella_{text_hash}"
-            entry = cache.setdefault(text_hash, {"path": None, "uuid": None})
-
-            if entry["path"] is None:
-                entry["path"] = await asyncio.get_event_loop().run_in_executor(
-                    None, _generate_wav, text, text_hash
-                )
-
-            if entry["uuid"] is None:
-                resp = await audiohub.get_audio_list()
-                audio_list = json.loads(
-                    (resp.get("data") or {}).get("data", "{}")
-                ).get("audio_list", [])
-                for item in audio_list:
-                    if item.get("CUSTOM_NAME") == file_name:
-                        await audiohub.delete_record(item["UNIQUE_ID"])
-                        break
-                with contextlib.redirect_stdout(io.StringIO()):
-                    await audiohub.upload_audio_file(entry["path"])
-                resp = await audiohub.get_audio_list()
-                audio_list = json.loads(
-                    (resp.get("data") or {}).get("data", "{}")
-                ).get("audio_list", [])
-                for item in audio_list:
-                    if item.get("CUSTOM_NAME") == file_name:
-                        entry["uuid"] = item["UNIQUE_ID"]
-                        break
-
-            if entry["uuid"]:
-                mute_t = time.monotonic() + TTS_MUTE_SEC
-                vad_state["mute_until"] = mute_t
-                tts_mute_until[0]       = mute_t   # also mutes USB mic path
-                preview = (text[:60] + "…") if len(text) > 60 else text
-                print(f"TTS: playing {repr(preview)} "
-                      f"(mute until +{TTS_MUTE_SEC:.1f}s)", flush=True)
-                await audiohub.play_by_uuid(entry["uuid"])
-                print(f"TTS: done {repr(preview)}", flush=True)
-            else:
-                print(f"TTS: NO UUID for {repr(text[:60])} — playback skipped",
-                      flush=True)
-        except Exception as e:
-            print(f"TTS error: {e}", flush=True)
-
-    async def recv_audio(frame):
-        """WebRTC robot-mic audio → VAD → Whisper (used when enable_audio=True)."""
-        if time.monotonic() < vad_state["mute_until"]:
-            return
-
-        raw  = np.frombuffer(frame.to_ndarray(), dtype=np.int16)
-        mono = raw.reshape(-1, ASR_CHANNELS).mean(axis=1).astype(np.int16)
-        rms  = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
-        vad_state["frame_count"] += 1
-        vad_state["max_rms"] = max(vad_state["max_rms"], rms)
-
-        if vad_state["frame_count"] % 200 == 0:
-            print(f"Audio alive: frame={vad_state['frame_count']}"
-                  f"  peak={vad_state['max_rms']:.0f}"
-                  f"  floor={vad_state['noise_floor']:.0f}", flush=True)
-            vad_state["max_rms"] = 0.0
-
-        if not vad_state["in_speech"]:
-            alpha = 0.05 if vad_state["frame_count"] < VAD_WARMUP_FRAMES \
-                    else NOISE_FLOOR_EMA_ALPHA
-            vad_state["noise_floor"] = (
-                alpha * rms + (1.0 - alpha) * vad_state["noise_floor"]
-            )
-
-        vad_state["accumulator"].extend(mono.tolist())
-        while len(vad_state["accumulator"]) >= VAD_FRAME_SAMPLES:
-            chunk = np.array(vad_state["accumulator"][:VAD_FRAME_SAMPLES], dtype=np.int16)
-            vad_state["accumulator"] = vad_state["accumulator"][VAD_FRAME_SAMPLES:]
-
-            if vad_state["frame_count"] < VAD_WARMUP_FRAMES:
-                continue
-
-            chunk_rms   = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
-            above_floor = chunk_rms > vad_state["noise_floor"] * NOISE_FLOOR_FACTOR
-            if above_floor:
-                try:
-                    is_speech = vad_engine.is_speech(chunk.tobytes(), ROBOT_SAMPLE_RATE)
-                except Exception:
-                    is_speech = False
-            else:
-                is_speech = False
-
-            if is_speech:
-                vad_state["speech_frames"]  += 1
-                vad_state["silence_frames"]  = 0
-                if vad_state["in_speech"]:
-                    vad_state["buf"].extend(chunk.tolist())
-                    vad_state["speech_samples"] += len(chunk)
-                    if len(vad_state["buf"]) >= max_samples:
-                        await _flush_audio()
-                elif vad_state["speech_frames"] >= VAD_SPEECH_FRAMES:
-                    vad_state["in_speech"] = True
-                    for pre in vad_state["pre_roll"]:
-                        vad_state["buf"].extend(pre)
-                        vad_state["speech_samples"] += len(pre)
-                    vad_state["pre_roll"].clear()
-                    vad_state["buf"].extend(chunk.tolist())
-                    vad_state["speech_samples"] += len(chunk)
-                else:
-                    vad_state["pre_roll"].append(chunk.tolist())
-            else:
-                vad_state["speech_frames"]  = 0
-                vad_state["silence_frames"] += 1
-                if vad_state["in_speech"]:
-                    vad_state["buf"].extend(chunk.tolist())
-                    if (vad_state["silence_frames"] >= VAD_SILENCE_FRAMES
-                            or len(vad_state["buf"]) >= max_samples):
-                        await _flush_audio()
-                else:
-                    vad_state["pre_roll"].append(chunk.tolist())
-
-    async def _flush_audio():
-        samples = np.array(list(vad_state["buf"]), dtype=np.int16)
-        vad_state["buf"].clear()
-        vad_state["in_speech"]      = False
-        vad_state["speech_frames"]  = 0
-        vad_state["silence_frames"] = 0
-        vad_state["speech_samples"] = 0
-        if len(samples) < min_samples:
-            return
-        print(f"ASR: sending {len(samples) / ROBOT_SAMPLE_RATE:.1f}s of audio", flush=True)
-        text = await asyncio.get_event_loop().run_in_executor(
-            None, stt.transcribe, samples
-        )
+            text = ""
         if text:
-            print(f"Heard: {text}", flush=True)
+            print(f"chat_go ASR: {text}", flush=True)
             try:
                 transcript_queue.put_nowait(text)
             except Exception:
                 pass
-        else:
-            print("ASR: no speech detected in clip", flush=True)
+    return _on_gpt_feedback
+
+
+def _run_robot_loop(robot_ip, frame_queue, say_queue, transcript_queue,
+                    action_queue, stop_event):
+    """Maintain the WebRTC connection and run all organ consumers on its loop.
+
+    The Go2 only accepts a single WebRTC peer connection, so video (eye), audio
+    output (mouth via audiohub), and sport-mode commands (limbs via datachannel)
+    all share one connection that lives here. When the connection drops we
+    cancel the organ consumer coroutines, reconnect, and relaunch them.
+    """
+
+    async def _video_track_callback(track):
+        await front_camera.recv_video(track, frame_queue, stop_event)
 
     async def connect_loop():
         while not stop_event.is_set():
-            conn        = None
-            audiohub    = None
+            conn = None
+            audiohub = None
             audio_cache = {}
-
-            nonlocal vad_state, vad_engine
-            vad_engine = _webrtcvad.Vad(VAD_AGGRESSIVENESS)
-            vad_state  = {
-                "buf":           deque(),
-                "accumulator":   [],
-                "pre_roll":      deque(maxlen=VAD_PRE_ROLL_FRAMES),
-                "in_speech":     False,
-                "speech_frames": 0, "silence_frames": 0, "speech_samples": 0,
-                "frame_count":   0, "max_rms": 0.0,
-                "mute_until":    0.0,
-                "noise_floor":   NOISE_FLOOR_INIT,
-            }
+            consumer_tasks = []
 
             try:
                 print(f"Connecting to {robot_ip}...", flush=True)
@@ -462,32 +259,18 @@ def _run_webrtc(robot_ip: str, frame_queue: Queue, say_queue: Queue,
                 await asyncio.wait_for(conn.connect(), timeout=30.0)
                 print("Connected. Starting video and mic...", flush=True)
 
+                # Eye — wire the video track to front_camera.recv_video.
                 conn.video.switchVideoChannel(True)
-                conn.video.add_track_callback(recv_video)
-                if enable_audio:
-                    conn.audio.switchAudioChannel(True)
-                    conn.audio.add_track_callback(recv_audio)
+                conn.video.add_track_callback(_video_track_callback)
 
-                # Forward any transcripts from the robot's onboard chat_go service.
-                def _on_gpt_feedback(msg):
-                    try:
-                        inner = msg.get("data") or msg
-                        if isinstance(inner, str):
-                            inner = json.loads(inner)
-                        text = (inner.get("text") or inner.get("asr_result")
-                                or inner.get("result") or "")
-                    except Exception:
-                        text = ""
-                    if text:
-                        print(f"chat_go ASR: {text}", flush=True)
-                        try:
-                            transcript_queue.put_nowait(text)
-                        except Exception:
-                            pass
+                # Onboard chat_go ASR feedback (forwarded into transcript_queue
+                # if the robot is configured to publish on this topic).
+                conn.datachannel.pub_sub.subscribe(
+                    RTC_TOPIC["GPT_FEEDBACK"],
+                    _make_gpt_feedback_handler(transcript_queue),
+                )
 
-                conn.datachannel.pub_sub.subscribe(RTC_TOPIC["GPT_FEEDBACK"],
-                                                   _on_gpt_feedback)
-
+                # Mouth — initialise the AudioHub and set speaker volume.
                 try:
                     audiohub = WebRTCAudioHub(conn)
                     print("AudioHub ready", flush=True)
@@ -498,38 +281,19 @@ def _run_webrtc(robot_ip: str, frame_queue: Queue, say_queue: Queue,
                     print(f"Speaker volume set to {SPEAKER_VOLUME}", flush=True)
                 except Exception as e:
                     print(f"AudioHub init failed (no TTS): {e}", flush=True)
+                    audiohub = None
 
-                action_task = None
-                pending_release = False
+                # Launch organ consumers on the same asyncio loop.
+                if audiohub:
+                    consumer_tasks.append(asyncio.ensure_future(
+                        tts.run_say_consumer(say_queue, audiohub,
+                                             stop_event, audio_cache)))
+                consumer_tasks.append(asyncio.ensure_future(
+                    actions.run_action_consumer(action_queue,
+                                                conn.datachannel, stop_event)))
+
+                # Idle until connection drops or shutdown is signalled.
                 while not stop_event.is_set() and conn.isConnected:
-                    if audiohub:
-                        try:
-                            text = say_queue.get_nowait()
-                            asyncio.ensure_future(_speak(text, audiohub, audio_cache))
-                        except Empty:
-                            pass
-                    # Serialize actions: only pop the next one after the previous
-                    # coroutine completes — so e.g. wiggle waits for stand_up
-                    # instead of running concurrently and being clobbered.
-                    if action_task is None or action_task.done():
-                        if action_task is not None and action_task.done():
-                            action_task = None
-                            # An action just finished. If no follow-up is queued,
-                            # release sticky Euler/Sit state once so the joystick
-                            # works again. If a follow-up IS queued, skip release
-                            # so it doesn't clobber the next action's pose commands.
-                            pending_release = True
-                        try:
-                            action_name = action_queue.get_nowait()
-                            fn = _ACTION_MAP.get(action_name)
-                            if fn:
-                                action_task = asyncio.ensure_future(fn(conn.datachannel))
-                                pending_release = False
-                        except Empty:
-                            if pending_release:
-                                action_task = asyncio.ensure_future(
-                                    actions.release_control(conn.datachannel))
-                                pending_release = False
                     await asyncio.sleep(0.5)
 
                 print("Connection lost, reconnecting...", flush=True)
@@ -538,6 +302,10 @@ def _run_webrtc(robot_ip: str, frame_queue: Queue, say_queue: Queue,
                     raise
                 print(f"WebRTC error: {type(e).__name__}: {e}", flush=True)
             finally:
+                # Stop organ consumers before tearing down the connection.
+                for t in consumer_tasks:
+                    if not t.done():
+                        t.cancel()
                 if conn:
                     try:
                         await conn.disconnect()
@@ -545,12 +313,6 @@ def _run_webrtc(robot_ip: str, frame_queue: Queue, say_queue: Queue,
                         pass
             if not stop_event.is_set():
                 await asyncio.sleep(RECONNECT_DELAY)
-
-    # Initialise here so connect_loop's nonlocal can rebind them each reconnect.
-    vad_engine = _webrtcvad.Vad(VAD_AGGRESSIVENESS)
-    vad_state  = {}
-    max_samples = int(MAX_SPEECH_SEC * ROBOT_SAMPLE_RATE)
-    min_samples = int(MIN_SPEECH_SEC * ROBOT_SAMPLE_RATE)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -560,7 +322,7 @@ def _run_webrtc(robot_ip: str, frame_queue: Queue, say_queue: Queue,
         loop.close()
 
 
-# ── Main display loop ─────────────────────────────────────────────────────────
+# ── Main entry: display + interaction state machine ──────────────────────────
 
 def main():
     robot_ip   = sys.argv[1] if len(sys.argv) > 1 else "192.168.123.161"
@@ -573,20 +335,23 @@ def main():
     transcript_font = pygame.font.SysFont("sans", 40)
     offline_surf    = _make_offline_surface(W, H)
 
+    # Inter-organ queues — owned here, handed to each organ via thread args.
     frame_queue:      Queue = Queue()
     say_queue:        Queue = Queue(maxsize=1)
     transcript_queue: Queue = Queue(maxsize=5)
     action_queue:     Queue = Queue(maxsize=4)
     stop_event = threading.Event()
 
-    webrtc_thread = threading.Thread(
-        target=_run_webrtc,
-        args=(robot_ip, frame_queue, say_queue, transcript_queue, action_queue, stop_event),
-        kwargs={"enable_audio": not USE_USB_MIC},
+    # Robot thread (eye + mouth + limbs sharing one WebRTC connection).
+    robot_thread = threading.Thread(
+        target=_run_robot_loop,
+        args=(robot_ip, frame_queue, say_queue, transcript_queue,
+              action_queue, stop_event),
         daemon=True,
     )
-    webrtc_thread.start()
+    robot_thread.start()
 
+    # Ear — USB-mic VAD + Whisper, writes into transcript_queue.
     if USE_USB_MIC:
         threading.Thread(
             target=stt.run_usb_mic,
@@ -594,8 +359,9 @@ def main():
             daemon=True,
         ).start()
 
-    rec_in:   Queue = Queue(maxsize=1)
-    rec_out:  Queue = Queue(maxsize=1)
+    # Face-recognition worker — reads (image, faces) pairs, writes (faces, names).
+    rec_in:  Queue = Queue(maxsize=1)
+    rec_out: Queue = Queue(maxsize=1)
     rec_thread = None
     if recognizer:
         rec_thread = threading.Thread(
@@ -616,18 +382,17 @@ def main():
     # ── Per-frame detection state ─────────────────────────────────────────
     last_faces           = []
     # Subset of last_faces whose bbox is not flush against any frame edge.
-    # Cropped faces are treated as "still searching" so seek pose keeps
-    # adjusting until a fully-framed face appears.
     last_complete_faces  = []
-    # Faces and names from the most recent recognition output, bundled
-    # together to avoid index drift if last_faces is updated mid-recognition.
+    # Bundle from the most recent recognition output — keeps faces+names
+    # in sync so name lookups are immune to last_faces index drift.
     last_rec_faces       = []
     last_rec_names       = []
     detect_counter       = 0
     last_frame_time      = 0.0
     prev_frame           = None
 
-    # ── Physical body pose ────────────────────────────────────────────────
+    # ── Physical body pose (tracked logically; the actual pose follows the
+    # consumed action_queue items, which may lag this state by ~1 s) ──────
     camera_pose      = "level"   # "level" | "seeking" | "seeking_sit"
     seek_start       = 0.0
     last_motion_time = 0.0
@@ -635,15 +400,14 @@ def main():
     # ── Interaction state machine ─────────────────────────────────────────
     interaction          = INTERACTION_IDLE
     interaction_entered  = 0.0
-    # Recognition vote buffer for the current RECOGNIZING session.
     recog_obs            = deque(maxlen=RECOG_VOTES_REQUIRED)
     # Best (sharpest) complete face captured during the current RECOGNIZING
     # session — used to enroll an unknown person even if the face has left
     # the frame by the moment the verdict fires.
     recog_best_face      = None
     # Hold-off timer: while now < recog_stabilize_until, skip vote/best-face
-    # updates so motion blur from the just-queued recovery action doesn't
-    # corrupt the verdict. 0 means no stabilization required.
+    # updates so motion blur from residual seek-pose settling doesn't corrupt
+    # the verdict. 0 means no stabilization required.
     recog_stabilize_until = 0.0
     last_complete_seen   = 0.0
     # Latest video frame dimensions, kept around so the recognition output
@@ -654,7 +418,8 @@ def main():
     last_greeted         = {}
     last_introduced      = 0.0
     enroll_state         = {"active": False, "frame": None, "landmarks": None,
-                            "bbox":   None,  "asked_at": 0.0, "best_sharpness": 0.0}
+                            "bbox":   None,  "asked_at": 0.0,
+                            "best_sharpness": 0.0}
 
     try:
         while True:
@@ -666,7 +431,7 @@ def main():
 
             now = time.monotonic()
 
-            # Pull the latest transcript (discard all but newest).
+            # ── Transcript handling (drives enrollment finalization) ──────
             try:
                 while True:
                     transcript_text = transcript_queue.get_nowait()
@@ -718,13 +483,10 @@ def main():
             except Empty:
                 pass
 
-            # Cancel enrollment if person didn't respond in time.
+            # Cancel enrollment if the person didn't respond in time.
             if enroll_state["active"] and now - enroll_state["asked_at"] >= ENROLL_TIMEOUT:
                 enroll_state["active"] = False
                 print("Enrollment timeout: no name received", flush=True)
-
-            # (Seek-timeout escalation and recovery are handled inside the
-            # interaction state machine below.)
 
             # Zoom state: hold the zoomed view for ZOOM_DURATION seconds.
             # The interaction state machine still advances (timers expire,
@@ -740,10 +502,7 @@ def main():
                     pygame.time.wait(FRAME_MS)
                     continue
 
-            # Pull latest recognition result. Each output is a (faces, names)
-            # bundle so name lookups are immune to last_faces index drift.
-            # In RECOGNIZING state, each new bundle adds one vote for the
-            # biggest-face's identity to the debounce buffer.
+            # ── Pull latest recognition result (faces, names bundle) ──────
             rec_got_new = False
             try:
                 while True:
@@ -753,7 +512,7 @@ def main():
                 pass
             if (rec_got_new and interaction == INTERACTION_RECOGNIZING
                     and last_rec_faces and now >= recog_stabilize_until):
-                # Only vote on fully-framed faces — a cropped face can't be
+                # Vote only on fully-framed faces — a cropped face can't be
                 # reliably recognized and would poison the verdict with a
                 # spurious "unknown". Also skip during stabilization so
                 # motion-blurred frames don't contribute.
@@ -776,9 +535,10 @@ def main():
                     current_surf = offline_surf
 
             if img is not None:
-                # Motion + person check is used by the state machine to decide
-                # IDLE → SEEKING. We only care about motion when at level pose;
-                # during seek/recognize the pose change itself causes motion.
+                # Motion + person check is used by the state machine to
+                # decide IDLE -> SEEKING. We only care about motion when at
+                # level pose; during seek/recognize the pose change itself
+                # causes motion.
                 motion_seen = False
                 if (camera_pose == "level"
                         and now - last_motion_time >= MOTION_COOLDOWN
@@ -805,10 +565,11 @@ def main():
                             rec_in.put_nowait((img.copy(), last_faces))
                         except Exception:
                             pass
-                    # While in RECOGNIZING, keep the sharpest complete face seen
-                    # so we can enroll an unknown person even if the face has
-                    # left the frame by the time the verdict fires. Skip during
-                    # stabilization — those frames are motion-blurred.
+
+                    # While in RECOGNIZING, track the sharpest complete face
+                    # seen so we can enroll an unknown person even if the
+                    # face has left the frame by the time the verdict fires.
+                    # Skip during stabilization — those frames are blurry.
                     if (interaction == INTERACTION_RECOGNIZING
                             and last_complete_faces
                             and now >= recog_stabilize_until):
@@ -824,8 +585,8 @@ def main():
                                     "landmarks": biggest[4] if len(biggest) > 4 else None,
                                     "sharpness": s,
                                 }
-                    # During an active enrollment, keep the sharpest fully-framed
-                    # face seen so the saved image is the best one in the window.
+                    # During active enrollment, keep the sharpest fully-framed
+                    # face so the saved image is the best one in the window.
                     if enroll_state["active"] and last_complete_faces:
                         biggest = max(last_complete_faces, key=lambda f: f[2] * f[3])
                         bx, by, bw, bh = biggest[:4]
@@ -846,7 +607,6 @@ def main():
                 if interaction == INTERACTION_IDLE:
                     if last_complete_faces:
                         # Face already visible at level — skip seeking.
-                        # No recovery action queued, so no stabilization needed.
                         interaction = INTERACTION_RECOGNIZING
                         interaction_entered = now
                         recog_obs.clear()
@@ -875,11 +635,7 @@ def main():
                         # look_up). The recovery action (stand_up /
                         # look_level) is queued only when we LEAVE
                         # RECOGNIZING, so the body holds steady throughout
-                        # vote accumulation and gives a clean capture
-                        # window. Stabilization here covers any residual
-                        # motion from the seek action still settling
-                        # (the sit transition is noticeably longer than
-                        # the look_up tilt).
+                        # vote accumulation and gives a clean capture window.
                         if camera_pose == "seeking_sit":
                             stabilize_sec = RECOG_STABILIZE_SIT_SEC
                         elif camera_pose == "seeking":
@@ -900,7 +656,7 @@ def main():
                               flush=True)
                     elif (camera_pose == "seeking"
                             and now - seek_start >= SEEK_TIMEOUT
-                            and not _queue_contains(action_queue, "look_up")):
+                            and not actions.queue_contains(action_queue, "look_up")):
                         # look_up didn't find a face — escalate to sit.
                         camera_pose = "seeking_sit"
                         seek_start  = now
@@ -929,15 +685,14 @@ def main():
                     face_lost  = now - last_complete_seen > FACE_LOST_TIMEOUT_SEC
 
                     # If we're about to leave RECOGNIZING, queue the recovery
-                    # action now (after the body has held the seek pose for
-                    # the whole capture window). For greetings the wiggle
-                    # queued by the known-verdict branch lands AFTER this
-                    # recovery, so the consumer order becomes
-                    # recovery -> wiggle.
+                    # action now (after the body has held the seek pose for the
+                    # whole capture window). For greetings, the wiggle queued
+                    # by the known-verdict branch lands AFTER this recovery, so
+                    # the consumer order becomes recovery -> wiggle.
                     if (decide_now or face_lost) and camera_pose != "level":
                         recovery = ("stand_up" if camera_pose == "seeking_sit"
                                     else "look_level")
-                        _drain_seek_actions(action_queue)
+                        actions.drain_seek_actions(action_queue)
                         try:
                             action_queue.put_nowait(recovery)
                         except Exception:
@@ -969,9 +724,9 @@ def main():
                                 last_greeted[verdict] = now
                                 last_introduced       = now   # also suppress introduce
                                 last_motion_time      = now
-                                # Prefer the live frame for the zoom label, but fall
-                                # back to the captured snapshot if the person has
-                                # already moved out of frame.
+                                # Prefer the live frame for the zoom label, but
+                                # fall back to the captured snapshot if the
+                                # person has already moved out of frame.
                                 if last_complete_faces:
                                     biggest = max(last_complete_faces,
                                                   key=lambda f: f[2] * f[3])
@@ -1053,7 +808,6 @@ def main():
                             interaction_entered = now
                             print("Recognition ambiguous -> cooldown", flush=True)
                     elif face_lost:
-                        # No verdict yet AND face is gone — give up.
                         interaction = INTERACTION_COOLDOWN
                         interaction_entered = now
                         print("Face lost before recognition completed -> cooldown",
@@ -1093,7 +847,7 @@ def main():
     finally:
         stop_event.set()
         pygame.quit()
-        webrtc_thread.join(timeout=5.0)
+        robot_thread.join(timeout=5.0)
         if rec_thread:
             rec_thread.join(timeout=5.0)
 
