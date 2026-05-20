@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Pella's brain: a thin sense-and-respond shell that dispatches to tasks.
+"""Pella's brain: a thin sense-and-respond shell that dispatches to a task manager.
 
 Each iteration of the main loop:
 
-  1. Drain transcript_queue; forward to the active task (which uses
-     them to finish enrollment, or ignores them).
-  2. tick() the active task — the task itself does its sensing
-     (frames, motion, face detection, recognition) and returns:
+  1. Drain transcript_queue; forward to the task manager (which routes
+     to the active task; tasks use transcripts to finish enrollment,
+     respond to commands, etc.).
+  2. tick() the task manager — the active task does its own sensing
+     (frames, motion, face detection, …) and returns:
         * latest_frame + faces for the live annotated display
-        * an optional zoom_request when greet/introduce fires
-        * an optional status event for logging / future routing
-  3. Render: zoom view if the task asked for one, otherwise the
-     annotated live frame.
+        * an optional display_request (image + duration) to pin on screen
+        * an optional status event for logging / further routing
+  3. Render: pinned image while active, otherwise the annotated live frame.
 
-pella_main doesn't know what INTRODUCING means or how recognition
-works — those live entirely in recog_greeting. To add a new behavior
-(e.g. follow_person, fetch), drop a new task module in alongside and
-hand it the same shared queues. Future task_manager will sit above
-pella_main and orchestrate switching between tasks.
+pella_main has zero knowledge of any concrete task type. Task selection,
+state machines, recognition policy — all live behind task_manager. To
+add a new behavior, register it in task_manager; pella_main does not
+change.
 
 The Go2 only accepts a single WebRTC peer connection; pella_main owns
 that connection and hands typed handles to each organ:
@@ -61,11 +60,11 @@ from go2_webrtc_driver.constants import RTC_TOPIC
 
 import actions
 import front_camera
-import recog_greeting
 import stt
+import task_manager
 import tts
 from stt import USE_USB_MIC, SPEAKER_VOLUME
-from vision import annotate, load_recognizer
+from vision import annotate
 
 
 # ── Display constants ─────────────────────────────────────────────────────────
@@ -219,8 +218,7 @@ def _run_robot_loop(robot_ip, frame_queue, say_queue, transcript_queue,
 # ── Main entry: sense-and-respond shell ──────────────────────────────────────
 
 def main():
-    robot_ip   = sys.argv[1] if len(sys.argv) > 1 else "192.168.123.161"
-    recognizer = load_recognizer()
+    robot_ip = sys.argv[1] if len(sys.argv) > 1 else "192.168.123.161"
 
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -253,11 +251,11 @@ def main():
             daemon=True,
         ).start()
 
-    # The current task. Today there's only one type; future task_manager will
-    # sit here and rotate between tasks based on context.
-    active_task = recog_greeting.RecogGreetingTask(
-        frame_queue, action_queue, say_queue, recognizer, stop_event,
-    )
+    # The task manager owns all task instantiation, selection, and shared
+    # perception resources (e.g. the face recognizer). pella_main only ever
+    # tick()s it and forwards transcripts.
+    tasks = task_manager.TaskManager(
+        frame_queue, action_queue, say_queue, stop_event)
 
     # ── Display state ─────────────────────────────────────────────────────
     # A task may ask us to pin a specific image on screen for N seconds via
@@ -289,16 +287,15 @@ def main():
                     transcript_text = text
                     transcript_time = now
                     print(f"Display: {text}", flush=True)
-                    active_task.submit_transcript(now, text)
+                    tasks.submit_transcript(now, text)
             except Empty:
                 pass
 
-            # Tick the active task — it does its own sensing internally.
-            result = active_task.tick(now)
+            # Tick the task manager — the active task does its own sensing.
+            result = tasks.tick(now)
 
             if result.status_event is not None:
-                print(f"Task[recog_greeting] event: {result.status_event}",
-                      flush=True)
+                print(f"Task event: {result.status_event}", flush=True)
 
             # If the task asked us to pin an image, store it. pella_main has no
             # opinion on what the image is for — just shows it for the duration.
