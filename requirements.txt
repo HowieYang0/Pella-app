@@ -1,0 +1,12 @@
+-e ../unitree_sdk2_python
+-e ../go2_webrtc_connect
+pydub
+gtts
+google-cloud-texttospeech==2.34.0
+dashscope==1.25.9
+sounddevice==0.5.1
+pyaudio==0.2.14
+soxr==1.0.0
+numpy>=1.26
+pygame>=2.0
+python-dotenv==1.2.1

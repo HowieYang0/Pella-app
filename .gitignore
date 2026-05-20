@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local backups created during refactors
+*.bak
+
+# Accidental save with a whitespace-only filename — leftover artifact
+" "
+
+# Large binaries — not tracked here (managed externally / git-lfs later)
+models/
+audio/

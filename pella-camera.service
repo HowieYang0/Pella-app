@@ -1,0 +1,19 @@
+[Unit]
+Description=Pella Front Camera Display
+After=graphical.target network.target
+
+[Service]
+User=pella
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pella/.Xauthority
+# Force Python stdout/stderr unbuffered so `print(..., flush=True)` reliably
+# lands in the systemd journal — without this some prints get block-buffered
+# and dropped between visible lines.
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/pella/Development/pella/pella_app
+ExecStart=/home/pella/Development/pella/pella_app/.venv/bin/python front_camera_display.py 192.168.123.161
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
