@@ -65,15 +65,13 @@ import recog_greeting
 import stt
 import tts
 from stt import USE_USB_MIC, SPEAKER_VOLUME
-from vision import ZOOM_DURATION, annotate, load_recognizer
+from vision import annotate, load_recognizer
 
 
 # ── Display constants ─────────────────────────────────────────────────────────
 RECONNECT_DELAY        = 5.0
 FRAME_MS               = 20
 TRANSCRIPT_DISPLAY_SEC = 8.0
-TRACKING = "tracking"
-ZOOMED   = "zoomed"
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -262,9 +260,11 @@ def main():
     )
 
     # ── Display state ─────────────────────────────────────────────────────
-    display_state    = TRACKING
-    zoom_surf        = None
-    zoom_start       = 0.0
+    # A task may ask us to pin a specific image on screen for N seconds via
+    # TickResult.display_request. While now < pinned_until, that image is
+    # shown; otherwise the live annotated frame is shown.
+    pinned_image     = None
+    pinned_until     = 0.0
     current_surf     = offline_surf
     transcript_text  = ""
     transcript_time  = 0.0
@@ -293,18 +293,6 @@ def main():
             except Empty:
                 pass
 
-            # If zoomed, hold the display — but keep ticking the task so it
-            # still advances (cooldown timers, enrollment, etc.).
-            if display_state == ZOOMED and now - zoom_start < ZOOM_DURATION:
-                active_task.tick(now)
-                screen.blit(zoom_surf, (0, 0))
-                if transcript_text and now - transcript_time < TRANSCRIPT_DISPLAY_SEC:
-                    _draw_transcript(screen, transcript_font, transcript_text, W, H)
-                pygame.display.flip()
-                pygame.time.wait(FRAME_MS)
-                continue
-            display_state = TRACKING
-
             # Tick the active task — it does its own sensing internally.
             result = active_task.tick(now)
 
@@ -312,24 +300,27 @@ def main():
                 print(f"Task[recog_greeting] event: {result.status_event}",
                       flush=True)
 
-            if result.zoom_request is not None:
-                zoom_bgr, _label = result.zoom_request
-                zoom_surf     = _to_surface(zoom_bgr, (W, H))
-                display_state = ZOOMED
-                zoom_start    = now
-                current_surf  = zoom_surf
+            # If the task asked us to pin an image, store it. pella_main has no
+            # opinion on what the image is for — just shows it for the duration.
+            if result.display_request is not None:
+                pinned_image = result.display_request.image
+                pinned_until = now + result.display_request.duration_sec
 
-            # Live (non-zoom) display.
-            if result.latest_frame is not None:
+            # Decide what to render: pinned image (while still active) or the
+            # latest live annotated frame.
+            if pinned_image is not None and now < pinned_until:
+                current_surf = _to_surface(pinned_image, (W, H))
+            elif result.latest_frame is not None:
+                pinned_image = None
                 last_frame_time = now
-                if display_state != ZOOMED:
-                    if result.latest_faces:
-                        annotated = annotate(result.latest_frame,
-                                             result.latest_faces)
-                    else:
-                        annotated = result.latest_frame
-                    current_surf = _to_surface(annotated, (W, H))
+                if result.latest_faces:
+                    annotated = annotate(result.latest_frame,
+                                         result.latest_faces)
+                else:
+                    annotated = result.latest_frame
+                current_surf = _to_surface(annotated, (W, H))
             elif now - last_frame_time > 3.0:
+                pinned_image = None
                 current_surf = offline_surf
 
             screen.blit(current_surf, (0, 0))

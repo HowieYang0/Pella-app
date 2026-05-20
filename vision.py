@@ -14,7 +14,6 @@ MIN_FACE_RATIO       = 0.05   # face width must be at least this fraction of fra
 DETECT_W, DETECT_H   = 640, 360
 FACE_DETECT_EVERY    = 5      # run detector every N frames
 ZOOM_PADDING         = 0.6    # padding around face when zooming in
-ZOOM_DURATION        = 3.0    # seconds to hold zoom
 ZOOM_COOLDOWN        = 10.0   # seconds between zoom events
 GREET_COOLDOWN       = 10.0   # seconds between greetings for the same person
 

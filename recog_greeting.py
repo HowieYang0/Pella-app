@@ -33,7 +33,7 @@ import threading
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from queue import Queue, Empty
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -45,6 +45,14 @@ from vision import (
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
+
+
+# ── Captured-face display ────────────────────────────────────────────────────
+# How long pella_main should pin the greeting/introduction zoom image on
+# screen before reverting to the live annotated feed. The task tells the
+# shell "show this image for N seconds" — pella_main has no opinion on
+# what the image means.
+CAPTURE_DISPLAY_SEC = 3.0
 
 
 # ── Task lifecycle phases ────────────────────────────────────────────────────
@@ -161,20 +169,36 @@ def _tally_recognition(obs):
 # ── tick result type ─────────────────────────────────────────────────────────
 
 @dataclass
+class DisplayRequest:
+    """A generic "pin this image on screen for N seconds" request.
+
+    The task hands pella_main a ready-to-display BGR image (it's already
+    drawn whatever overlays it wants — face crop, name label, etc.) and a
+    duration. pella_main has no knowledge of what the image represents.
+    """
+    image: np.ndarray
+    duration_sec: float
+
+
+@dataclass
 class TickResult:
     """What pella_main needs after one tick of the task.
 
     latest_frame / latest_faces let pella_main render the live annotated
-    display (since the task owns frame_queue consumption now). zoom_request
-    fires ONCE on the transition tick where greet/introduce begins; pella_main
-    builds the ZOOMED surface from it. status_event fires ONCE when the task
-    transitions through a meaningful state — pella_main can log it or react
-    however it likes (e.g. routing to a higher-level task_manager later).
+    feed (since the task owns frame_queue consumption now).
+
+    display_request fires ONCE on a transition tick where the task wants
+    pella_main to show a specific image for a while — e.g. a zoomed face
+    with a name label after a successful greeting.
+
+    status_event fires ONCE when the task transitions through a meaningful
+    state — pella_main can log it or route it elsewhere (e.g. into a future
+    task_manager).
     """
-    latest_frame: Optional[np.ndarray] = None
-    latest_faces: list                 = field(default_factory=list)
-    zoom_request: Optional[Tuple[np.ndarray, Optional[str]]] = None
-    status_event: Optional[str]        = None
+    latest_frame: Optional[np.ndarray]            = None
+    latest_faces: list                            = field(default_factory=list)
+    display_request: Optional[DisplayRequest]     = None
+    status_event: Optional[str]                   = None
 
 
 # ── The task ─────────────────────────────────────────────────────────────────
@@ -628,7 +652,8 @@ class RecogGreetingTask:
             cv2.putText(zoom_bgr, verdict, (20, zoom_bgr.shape[0] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2,
                         (0, 255, 0), 2, cv2.LINE_AA)
-            result.zoom_request = (zoom_bgr, verdict)
+            result.display_request = DisplayRequest(
+                image=zoom_bgr, duration_sec=CAPTURE_DISPLAY_SEC)
 
         self._phase          = GREETING
         self._phase_entered  = now
@@ -683,7 +708,8 @@ class RecogGreetingTask:
 
         crop = zoom_crop(self._recog_best_face["img"],
                          self._recog_best_face["bbox"])
-        result.zoom_request = (crop, None)
+        result.display_request = DisplayRequest(
+            image=crop, duration_sec=CAPTURE_DISPLAY_SEC)
 
         self._phase          = INTRODUCING
         self._phase_entered  = now
