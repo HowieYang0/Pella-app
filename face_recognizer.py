@@ -49,6 +49,28 @@ def _detect_face_landmarks(det, bgr: np.ndarray):
     return lm.astype(np.float32)
 
 
+def next_image_index(save_dir: str) -> int:
+    """Return the next available 1-based image index for a face_ids/<person>/
+    folder.
+
+    The folder convention is zero-padded three-digit `NNN.jpg` files (plus
+    matching `NNN.npy` for embeddings when produced by FaceRecognizer).
+    Used by both the main enrollment path and the no-recognizer fallback in
+    recog_greeting so multiple captures for the same person never collide.
+    """
+    if not os.path.isdir(save_dir):
+        return 1
+    max_idx = 0
+    for f in os.listdir(save_dir):
+        stem, ext = os.path.splitext(f)
+        if ext.lower() in (".jpg", ".jpeg", ".png"):
+            try:
+                max_idx = max(max_idx, int(stem))
+            except ValueError:
+                pass
+    return max_idx + 1
+
+
 class FaceRecognizer:
     def __init__(self, model_path: str, face_ids_dir: str,
                  yunet_path: str = "", threshold: float = 0.35,
@@ -148,15 +170,7 @@ class FaceRecognizer:
 
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
-            max_idx = 0
-            for f in os.listdir(save_dir):
-                stem, ext = os.path.splitext(f)
-                if ext.lower() in (".jpg", ".jpeg", ".png"):
-                    try:
-                        max_idx = max(max_idx, int(stem))
-                    except ValueError:
-                        pass
-            idx = max_idx + 1
+            idx = next_image_index(save_dir)
 
             if face_bbox is not None:
                 x, y, fw, fh = face_bbox[:4]

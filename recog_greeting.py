@@ -39,6 +39,7 @@ import cv2
 import numpy as np
 
 import actions
+import face_recognizer
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, ENROLL_TIMEOUT, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
@@ -363,8 +364,12 @@ class RecogGreetingTask:
                 save_dir,
             )
         else:
+            # No recognizer loaded — fall back to saving the captured frame
+            # only (no embedding). Use the same NNN.jpg numbering scheme so
+            # repeat enrollments for the same person don't overwrite each other.
             os.makedirs(save_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(save_dir, "001.jpg"),
+            idx = face_recognizer.next_image_index(save_dir)
+            cv2.imwrite(os.path.join(save_dir, f"{idx:03d}.jpg"),
                         self._enroll_state["frame"])
             enrolled = True
         self._enroll_state["active"] = False
