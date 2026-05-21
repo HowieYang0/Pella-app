@@ -212,13 +212,18 @@ class RecogGreetingTask:
     detection, advances the state machine, and returns a TickResult.
     """
 
-    def __init__(self, frame_queue, action_queue, say_queue, recognizer,
-                 stop_event):
+    def __init__(self, frame_queue, action_queue, say_queue, prep_queue,
+                 recognizer, stop_event):
         """Wire dependencies and start the recognition worker thread.
 
         frame_queue / action_queue / say_queue: shared queues filled or drained
                                                  by other organs (eye / limbs /
                                                  mouth).
+        prep_queue:  TTS pre-cache channel. Pushing a text here uploads the
+                     WAV to the audiohub without playing it, so a subsequent
+                     say of the same text fires immediately. Used for
+                     dynamic name-dependent phrases that the startup warmup
+                     can't anticipate.
         recognizer:  the ArcFace recognizer, or None if disabled.
         stop_event:  pella_main's shutdown flag; the recognition worker
                      thread exits when this is set.
@@ -226,6 +231,7 @@ class RecogGreetingTask:
         self._frame_queue  = frame_queue
         self._action_queue = action_queue
         self._say_queue    = say_queue
+        self._prep_queue   = prep_queue
         self._recognizer   = recognizer
         self._stop_event   = stop_event
 
@@ -375,6 +381,22 @@ class RecogGreetingTask:
         dir_name     = name_raw.lower().replace(" ", "_")
         display_name = name_raw.title()
         save_dir     = os.path.join(FACE_IDS_DIR, dir_name)
+
+        # Kick off TTS pre-cache for whichever phrase we'll say next, RIGHT
+        # NOW — generation + audiohub upload (~10-20 s) will overlap with
+        # enrollment (~1-2 s) and any time the user spent talking. By the
+        # time we actually put the phrase on say_queue, the cache should
+        # be partially or fully warm and playback fires sooner.
+        for prep_text in (
+            f"Nice to meet you, {display_name}!",
+            f"You don't look like the {display_name} I know. "
+            f"Sorry about that.",
+        ):
+            try:
+                self._prep_queue.put_nowait(prep_text)
+            except Exception:
+                pass
+
         if self._recognizer:
             enrolled = self._recognizer.enroll_new(
                 dir_name,

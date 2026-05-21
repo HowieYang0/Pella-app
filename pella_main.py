@@ -127,8 +127,9 @@ def _make_gpt_feedback_handler(transcript_queue):
     return _on_gpt_feedback
 
 
-def _run_robot_loop(robot_ip, frame_queue, say_queue, transcript_queue,
-                    action_queue, stop_event, warm_phrases=None):
+def _run_robot_loop(robot_ip, frame_queue, say_queue, prep_queue,
+                    transcript_queue, action_queue, stop_event,
+                    warm_phrases=None):
     """Maintain the WebRTC connection and run all organ consumers on its loop.
 
     The Go2 only accepts a single WebRTC peer connection, so video (eye),
@@ -189,6 +190,12 @@ def _run_robot_loop(robot_ip, frame_queue, say_queue, transcript_queue,
                     consumer_tasks.append(asyncio.ensure_future(
                         tts.run_say_consumer(say_queue, audiohub,
                                              stop_event, audio_cache)))
+                    # Pre-cache requests from tasks (e.g. names parsed at
+                    # runtime) — shares the audio_cache with the say
+                    # consumer so a later say() hits the warm UUID.
+                    consumer_tasks.append(asyncio.ensure_future(
+                        tts.run_prep_consumer(prep_queue, audiohub,
+                                              stop_event, audio_cache)))
                 consumer_tasks.append(asyncio.ensure_future(
                     actions.run_action_consumer(action_queue,
                                                 conn.datachannel, stop_event)))
@@ -237,6 +244,11 @@ def main():
     # Inter-organ queues — owned here, handed to each organ via thread args.
     frame_queue:      Queue = Queue()
     say_queue:        Queue = Queue(maxsize=1)
+    # prep_queue is a generic "warm the TTS cache for this phrase NOW" channel.
+    # Tasks push to it when they know they'll soon want to say something whose
+    # text wasn't predictable at startup (e.g. "Nice to meet you, <NewName>!"
+    # the moment a new name is parsed from STT).
+    prep_queue:       Queue = Queue(maxsize=4)
     transcript_queue: Queue = Queue(maxsize=5)
     action_queue:     Queue = Queue(maxsize=4)
     stop_event = threading.Event()
@@ -246,13 +258,13 @@ def main():
     # tick()s it and forwards transcripts. Build it first so we can hand its
     # warm-phrase list to the robot thread on startup.
     tasks = task_manager.TaskManager(
-        frame_queue, action_queue, say_queue, stop_event)
+        frame_queue, action_queue, say_queue, prep_queue, stop_event)
     warm_phrases = tasks.get_warm_phrases()
 
     # Robot thread — eye + mouth + limbs sharing one WebRTC connection.
     robot_thread = threading.Thread(
         target=_run_robot_loop,
-        args=(robot_ip, frame_queue, say_queue, transcript_queue,
+        args=(robot_ip, frame_queue, say_queue, prep_queue, transcript_queue,
               action_queue, stop_event, warm_phrases),
         daemon=True,
     )

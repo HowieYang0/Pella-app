@@ -33,7 +33,8 @@ class TaskManager:
     None of that changes the surface seen by pella_main.
     """
 
-    def __init__(self, frame_queue, action_queue, say_queue, stop_event):
+    def __init__(self, frame_queue, action_queue, say_queue, prep_queue,
+                 stop_event):
         # Shared perception resources (used by tasks that need identity).
         # Loaded here so pella_main doesn't need to know any task cares.
         recognizer = load_recognizer()
@@ -41,7 +42,8 @@ class TaskManager:
         # Today: a single perpetual recog_greeting task. Future: a registry
         # or stack of tasks, plus switching policy.
         self._active_task = recog_greeting.RecogGreetingTask(
-            frame_queue, action_queue, say_queue, recognizer, stop_event,
+            frame_queue, action_queue, say_queue, prep_queue,
+            recognizer, stop_event,
         )
 
     def tick(self, now):

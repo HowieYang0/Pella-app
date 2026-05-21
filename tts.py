@@ -183,3 +183,26 @@ async def run_say_consumer(say_queue, audiohub, stop_event, cache=None):
         await asyncio.sleep(0.5)
 
 
+async def run_prep_consumer(prep_queue, audiohub, stop_event, cache=None):
+    """Drain prep_queue and pre-cache each phrase without playing.
+
+    Lets a task hand off "I'm about to say this — please start uploading
+    now" requests that overlap with the rest of its work. By the time the
+    task actually puts the same text on say_queue, speak() hits a warm
+    cache and play_by_uuid fires immediately.
+
+    Used today for dynamic, name-dependent phrases the startup warmup
+    can't anticipate — most importantly "Nice to meet you, <New Name>!"
+    queued the instant the new person's name is parsed from STT.
+    """
+    if cache is None:
+        cache = {}
+    while not stop_event.is_set():
+        try:
+            text = prep_queue.get_nowait()
+            asyncio.ensure_future(prepare(text, audiohub, cache))
+        except Empty:
+            pass
+        await asyncio.sleep(0.2)
+
+
