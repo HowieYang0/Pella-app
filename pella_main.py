@@ -128,7 +128,7 @@ def _make_gpt_feedback_handler(transcript_queue):
 
 
 def _run_robot_loop(robot_ip, frame_queue, say_queue, transcript_queue,
-                    action_queue, stop_event):
+                    action_queue, stop_event, warm_phrases=None):
     """Maintain the WebRTC connection and run all organ consumers on its loop.
 
     The Go2 only accepts a single WebRTC peer connection, so video (eye),
@@ -176,6 +176,13 @@ def _run_robot_loop(robot_ip, frame_queue, say_queue, transcript_queue,
                 except Exception as e:
                     print(f"AudioHub init failed (no TTS): {e}", flush=True)
                     audiohub = None
+
+                # Pre-cache phrases the active task expects to say so the
+                # first-time gen+upload latency doesn't show up mid-interaction.
+                # Runs in the background; doesn't block other consumers.
+                if audiohub and warm_phrases:
+                    consumer_tasks.append(asyncio.ensure_future(
+                        tts.run_warmup(warm_phrases, audiohub, audio_cache)))
 
                 # Launch organ consumers on the same asyncio loop.
                 if audiohub:
@@ -234,11 +241,19 @@ def main():
     action_queue:     Queue = Queue(maxsize=4)
     stop_event = threading.Event()
 
+    # The task manager owns all task instantiation, selection, and shared
+    # perception resources (e.g. the face recognizer). pella_main only ever
+    # tick()s it and forwards transcripts. Build it first so we can hand its
+    # warm-phrase list to the robot thread on startup.
+    tasks = task_manager.TaskManager(
+        frame_queue, action_queue, say_queue, stop_event)
+    warm_phrases = tasks.get_warm_phrases()
+
     # Robot thread — eye + mouth + limbs sharing one WebRTC connection.
     robot_thread = threading.Thread(
         target=_run_robot_loop,
         args=(robot_ip, frame_queue, say_queue, transcript_queue,
-              action_queue, stop_event),
+              action_queue, stop_event, warm_phrases),
         daemon=True,
     )
     robot_thread.start()
@@ -250,12 +265,6 @@ def main():
             args=(transcript_queue, stop_event),
             daemon=True,
         ).start()
-
-    # The task manager owns all task instantiation, selection, and shared
-    # perception resources (e.g. the face recognizer). pella_main only ever
-    # tick()s it and forwards transcripts.
-    tasks = task_manager.TaskManager(
-        frame_queue, action_queue, say_queue, stop_event)
 
     # ── Display state ─────────────────────────────────────────────────────
     # A task may ask us to pin a specific image on screen for N seconds via

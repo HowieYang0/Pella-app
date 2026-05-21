@@ -51,3 +51,7 @@ class TaskManager:
     def submit_transcript(self, now, text) -> bool:
         """Forward a transcript line to the active task."""
         return self._active_task.submit_transcript(now, text)
+
+    def get_warm_phrases(self) -> list:
+        """Collect phrases the active task wants pre-cached at startup."""
+        return self._active_task.get_warm_phrases()

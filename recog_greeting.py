@@ -276,6 +276,26 @@ class RecogGreetingTask:
             "bbox":   None,  "asked_at": 0.0, "best_sharpness": 0.0,
         }
 
+    # ── TTS pre-warm ─────────────────────────────────────────────────────
+
+    def get_warm_phrases(self) -> list:
+        """Phrases pella_main should pre-cache at startup to eliminate the
+        first-time gen+upload latency for this task's likely utterances.
+
+        Static prompts (always relevant) + a per-name "Hi, X" / "Nice to
+        meet you, X" pair for each currently-enrolled person.
+        """
+        phrases = [
+            "Hello, I am Pella. What is your name?",
+            "Sorry, I didn't catch your name.",
+        ]
+        if self._recognizer is not None:
+            for name in getattr(self._recognizer, "known", {}):
+                display = name.replace("_", " ").title()
+                phrases.append(f"Hi, {display}")
+                phrases.append(f"Nice to meet you, {display}!")
+        return phrases
+
     # ── Per-iteration tick ───────────────────────────────────────────────
 
     def tick(self, now) -> TickResult:
@@ -582,25 +602,11 @@ class RecogGreetingTask:
                       or now - self._phase_entered >= RECOG_TIMEOUT_SEC)
         face_lost  = now - self._last_complete_seen > FACE_LOST_TIMEOUT_SEC
 
-        # About to leave RECOGNIZING — queue recovery first so the body comes
-        # back to level. Greet branch's wiggle lands AFTER this recovery, so
-        # the consumer order becomes recovery -> wiggle.
-        if (decide_now or face_lost) and self._camera_pose != "level":
-            recovery = ("stand_up" if self._camera_pose == "seeking_sit"
-                        else "look_level")
-            actions.drain_seek_actions(self._action_queue)
-            try:
-                self._action_queue.put_nowait(recovery)
-            except Exception:
-                pass
-            self._camera_pose       = "level"
-            self._last_motion_time  = now
-            print(f"Task[recog_greeting]: leaving recognizing, queueing {recovery}",
-                  flush=True)
-
         if decide_now:
             return self._dispatch_verdict(now, img, result)
         if face_lost:
+            # No TTS — recovery can happen immediately.
+            self._queue_recovery(now, after_tts=False)
             self._phase         = COOLDOWN
             self._phase_entered = now
             print("Task[recog_greeting]: face lost before recognition completed "
@@ -608,13 +614,39 @@ class RecogGreetingTask:
             result.status_event = STATUS_FAILURE
         return result
 
+    def _queue_recovery(self, now, after_tts: bool):
+        """Queue the recovery action (stand_up / look_level) if needed.
+
+        When after_tts=True, prepend wait_for_tts so the action consumer
+        sleeps a bit before issuing the motor command. This lets a just-
+        queued say() utterance play through the speaker cleanly before
+        motor activity competes with audio on the WebRTC channel.
+        """
+        if self._camera_pose == "level":
+            return
+        recovery = ("stand_up" if self._camera_pose == "seeking_sit"
+                    else "look_level")
+        actions.drain_seek_actions(self._action_queue)
+        try:
+            if after_tts:
+                self._action_queue.put_nowait("wait_for_tts")
+            self._action_queue.put_nowait(recovery)
+        except Exception:
+            pass
+        self._camera_pose       = "level"
+        self._last_motion_time  = now
+        print(f"Task[recog_greeting]: leaving recognizing, queueing "
+              f"{'wait_for_tts -> ' if after_tts else ''}{recovery}",
+              flush=True)
+
     def _dispatch_verdict(self, now, img, result: TickResult) -> TickResult:
         verdict, kind = _tally_recognition(self._recog_obs)
         if kind == "known":
             return self._enter_greeting(now, img, verdict, result)
         if kind == "unknown":
             return self._enter_introducing(now, result)
-        # ambiguous
+        # ambiguous — no TTS, recovery can fire immediately.
+        self._queue_recovery(now, after_tts=False)
         self._phase         = COOLDOWN
         self._phase_entered = now
         print("Task[recog_greeting]: recognition ambiguous -> cooldown",
@@ -625,6 +657,8 @@ class RecogGreetingTask:
     def _enter_greeting(self, now, img, verdict, result: TickResult) -> TickResult:
         display_name = verdict.replace("_", " ").title()
         if (now - self._last_greeted.get(verdict, 0.0)) < GREET_COOLDOWN:
+            # Recovery still needed; no TTS so no wait.
+            self._queue_recovery(now, after_tts=False)
             self._phase         = COOLDOWN
             self._phase_entered = now
             print(f"Task[recog_greeting]: already greeted {display_name} recently "
@@ -632,8 +666,16 @@ class RecogGreetingTask:
             result.status_event = STATUS_KNOWN_PERSON
             return result
 
+        # Say first so TTS uploads/plays as soon as possible, then queue
+        # wait_for_tts + recovery so motor activity holds off until audio
+        # has had time to come through the speaker. wiggle lands after
+        # recovery as the final gesture.
         try:
             self._say_queue.put_nowait(f"Hi, {display_name}")
+        except Exception:
+            pass
+        self._queue_recovery(now, after_tts=True)
+        try:
             self._action_queue.put_nowait("wiggle")
         except Exception:
             pass
@@ -668,6 +710,7 @@ class RecogGreetingTask:
 
     def _enter_introducing(self, now, result: TickResult) -> TickResult:
         if self._enroll_state["active"]:
+            self._queue_recovery(now, after_tts=False)
             self._phase         = COOLDOWN
             self._phase_entered = now
             print("Task[recog_greeting]: unknown but enrollment already active "
@@ -675,6 +718,7 @@ class RecogGreetingTask:
             result.status_event = STATUS_NEW_PERSON
             return result
         if now - self._last_introduced < INTRODUCE_COOLDOWN:
+            self._queue_recovery(now, after_tts=False)
             self._phase         = COOLDOWN
             self._phase_entered = now
             print(f"Task[recog_greeting]: unknown but introduce on cooldown "
@@ -684,6 +728,7 @@ class RecogGreetingTask:
             return result
         if (self._recog_best_face is None
                 or self._recog_best_face["sharpness"] < SHARPNESS_THRESHOLD):
+            self._queue_recovery(now, after_tts=False)
             self._phase         = COOLDOWN
             self._phase_entered = now
             sharp_str = (f"{self._recog_best_face['sharpness']:.1f}"
@@ -694,12 +739,15 @@ class RecogGreetingTask:
             result.status_event = STATUS_NOT_RECOGNIZED
             return result
 
+        # Say first, then queue wait_for_tts + recovery so the "Hello, I am
+        # Pella…" prompt plays through before stand_up kicks the motors.
         try:
             self._say_queue.put_nowait(
                 "Hello, I am Pella. What is your name?")
         except Exception as e:
             print(f"Task[recog_greeting]: WARN say_queue full, "
                   f"name-ask not queued: {e}", flush=True)
+        self._queue_recovery(now, after_tts=True)
         self._enroll_state.update({
             "active":         True,
             "frame":          self._recog_best_face["img"],

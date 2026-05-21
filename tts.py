@@ -103,7 +103,66 @@ async def speak(text: str, audiohub, cache: dict):
         print(f"TTS error: {e}", flush=True)
 
 
-# ── Say queue consumer ───────────────────────────────────────────────────────
+# ── Cache pre-warm ───────────────────────────────────────────────────────────
+
+async def prepare(text: str, audiohub, cache: dict):
+    """Generate WAV + upload to audiohub but DO NOT play.
+
+    Pre-warms the cache so a subsequent speak(text, …) hits the cached UUID
+    and the play_by_uuid request fires immediately. Used at startup for
+    static prompts and proactively when a task knows it will say something
+    soon (e.g. as soon as a name is parsed from STT).
+    """
+    try:
+        text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+        file_name = f"pella_{text_hash}"
+        entry = cache.setdefault(text_hash, {"path": None, "uuid": None})
+
+        if entry["path"] is None:
+            entry["path"] = await asyncio.get_event_loop().run_in_executor(
+                None, _generate_wav, text, text_hash
+            )
+
+        if entry["uuid"] is None:
+            resp = await audiohub.get_audio_list()
+            audio_list = json.loads(
+                (resp.get("data") or {}).get("data", "{}")
+            ).get("audio_list", [])
+            for item in audio_list:
+                if item.get("CUSTOM_NAME") == file_name:
+                    entry["uuid"] = item["UNIQUE_ID"]
+                    break
+            if entry["uuid"] is None:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    await audiohub.upload_audio_file(entry["path"])
+                resp = await audiohub.get_audio_list()
+                audio_list = json.loads(
+                    (resp.get("data") or {}).get("data", "{}")
+                ).get("audio_list", [])
+                for item in audio_list:
+                    if item.get("CUSTOM_NAME") == file_name:
+                        entry["uuid"] = item["UNIQUE_ID"]
+                        break
+        return entry["uuid"] is not None
+    except Exception as e:
+        print(f"TTS prepare error for {repr(text[:60])}: {e}", flush=True)
+        return False
+
+
+async def run_warmup(phrases, audiohub, cache: dict):
+    """Sequentially pre-cache a list of phrases. Logs each one."""
+    if not phrases:
+        return
+    print(f"TTS: warming cache for {len(phrases)} phrase(s)…", flush=True)
+    for text in phrases:
+        ok = await prepare(text, audiohub, cache)
+        preview = (text[:50] + "…") if len(text) > 50 else text
+        print(f"TTS: {'cached' if ok else 'FAILED'} {repr(preview)}",
+              flush=True)
+    print("TTS: warmup done", flush=True)
+
+
+# ── Queue consumers ──────────────────────────────────────────────────────────
 
 async def run_say_consumer(say_queue, audiohub, stop_event, cache=None):
     """Drain say_queue and play each utterance.
@@ -122,3 +181,5 @@ async def run_say_consumer(say_queue, audiohub, stop_event, cache=None):
         except Empty:
             pass
         await asyncio.sleep(0.5)
+
+

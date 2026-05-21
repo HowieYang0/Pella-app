@@ -125,16 +125,31 @@ async def dance(datachannel):
     print("Action: dance", flush=True)
 
 
+async def wait_for_tts(datachannel, seconds: float = 2.0):
+    """Sleep so a TTS utterance queued just before us has time to play.
+
+    Motor commands and audiohub playback share the same WebRTC channel; if
+    we queue a motor action immediately after a `say` request, the motor
+    activity can starve the speaker buffer and chop the audio. Tasks
+    queue this primitive between their say and the next motor action when
+    the audio needs to be heard cleanly (e.g. before standing up after
+    a sit-pose greeting).
+    """
+    await asyncio.sleep(seconds)
+    print("Action: wait_for_tts", flush=True)
+
+
 # ── Action dispatch ──────────────────────────────────────────────────────────
 
 ACTION_MAP = {
-    "look_up":     look_up,
-    "look_level":  look_level,
-    "sit_look_up": sit_look_up,
-    "stand_up":    stand_up,
-    "wiggle":      wiggle,
-    "hello":       hello,
-    "dance":       dance,
+    "look_up":      look_up,
+    "look_level":   look_level,
+    "sit_look_up":  sit_look_up,
+    "stand_up":     stand_up,
+    "wiggle":       wiggle,
+    "hello":        hello,
+    "dance":        dance,
+    "wait_for_tts": wait_for_tts,
 }
 
 # Seek-pose actions — used by drain_seek_actions to selectively flush stale
