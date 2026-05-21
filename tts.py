@@ -57,29 +57,50 @@ async def speak(text: str, audiohub, cache: dict):
     Sets `tts_mute_until[0]` to silence the USB-mic capture path for
     TTS_MUTE_SEC seconds starting now, so the robot's speaker output doesn't
     get re-transcribed.
+
+    Each phase is timed and logged with a tag identifying the utterance, so
+    we can see exactly which step (gen / upload / list / play) consumes the
+    wall time when there's an end-to-end delay.
     """
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         file_name = f"pella_{text_hash}"
         entry = cache.setdefault(text_hash, {"path": None, "uuid": None})
+        preview = (text[:60] + "…") if len(text) > 60 else text
+        tag = f"[{text_hash}]"
 
         if entry["path"] is None:
+            t0 = time.monotonic()
             entry["path"] = await asyncio.get_event_loop().run_in_executor(
                 None, _generate_wav, text, text_hash
             )
+            print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
+                  f"{repr(preview)}", flush=True)
 
         if entry["uuid"] is None:
+            t0 = time.monotonic()
             resp = await audiohub.get_audio_list()
+            print(f"TTS {tag} get_list_before: {time.monotonic()-t0:.2f}s",
+                  flush=True)
             audio_list = json.loads(
                 (resp.get("data") or {}).get("data", "{}")
             ).get("audio_list", [])
             for item in audio_list:
                 if item.get("CUSTOM_NAME") == file_name:
+                    t0 = time.monotonic()
                     await audiohub.delete_record(item["UNIQUE_ID"])
+                    print(f"TTS {tag} delete_old: "
+                          f"{time.monotonic()-t0:.2f}s", flush=True)
                     break
+            t0 = time.monotonic()
             with contextlib.redirect_stdout(io.StringIO()):
                 await audiohub.upload_audio_file(entry["path"])
+            print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
+                  f"({os.path.getsize(entry['path'])} bytes)", flush=True)
+            t0 = time.monotonic()
             resp = await audiohub.get_audio_list()
+            print(f"TTS {tag} get_list_after: {time.monotonic()-t0:.2f}s",
+                  flush=True)
             audio_list = json.loads(
                 (resp.get("data") or {}).get("data", "{}")
             ).get("audio_list", [])
@@ -91,13 +112,14 @@ async def speak(text: str, audiohub, cache: dict):
         if entry["uuid"]:
             mute_t = time.monotonic() + TTS_MUTE_SEC
             tts_mute_until[0] = mute_t   # USB-mic path reads this to self-mute
-            preview = (text[:60] + "…") if len(text) > 60 else text
-            print(f"TTS: playing {repr(preview)} "
+            print(f"TTS {tag} playing {repr(preview)} "
                   f"(mute until +{TTS_MUTE_SEC:.1f}s)", flush=True)
+            t0 = time.monotonic()
             await audiohub.play_by_uuid(entry["uuid"])
-            print(f"TTS: done {repr(preview)}", flush=True)
+            print(f"TTS {tag} play_by_uuid_call: "
+                  f"{time.monotonic()-t0:.2f}s (done)", flush=True)
         else:
-            print(f"TTS: NO UUID for {repr(text[:60])} — playback skipped",
+            print(f"TTS {tag} NO UUID for {repr(preview)} — playback skipped",
                   flush=True)
     except Exception as e:
         print(f"TTS error: {e}", flush=True)
@@ -112,19 +134,30 @@ async def prepare(text: str, audiohub, cache: dict):
     and the play_by_uuid request fires immediately. Used at startup for
     static prompts and proactively when a task knows it will say something
     soon (e.g. as soon as a name is parsed from STT).
+
+    Same per-phase timing prints as speak(), tagged with the text_hash so
+    a prep followed by a speak can be matched up in the journal.
     """
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         file_name = f"pella_{text_hash}"
         entry = cache.setdefault(text_hash, {"path": None, "uuid": None})
+        preview = (text[:50] + "…") if len(text) > 50 else text
+        tag = f"[{text_hash} prep]"
 
         if entry["path"] is None:
+            t0 = time.monotonic()
             entry["path"] = await asyncio.get_event_loop().run_in_executor(
                 None, _generate_wav, text, text_hash
             )
+            print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
+                  f"{repr(preview)}", flush=True)
 
         if entry["uuid"] is None:
+            t0 = time.monotonic()
             resp = await audiohub.get_audio_list()
+            print(f"TTS {tag} get_list_before: "
+                  f"{time.monotonic()-t0:.2f}s", flush=True)
             audio_list = json.loads(
                 (resp.get("data") or {}).get("data", "{}")
             ).get("audio_list", [])
@@ -133,9 +166,16 @@ async def prepare(text: str, audiohub, cache: dict):
                     entry["uuid"] = item["UNIQUE_ID"]
                     break
             if entry["uuid"] is None:
+                t0 = time.monotonic()
                 with contextlib.redirect_stdout(io.StringIO()):
                     await audiohub.upload_audio_file(entry["path"])
+                print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
+                      f"({os.path.getsize(entry['path'])} bytes)",
+                      flush=True)
+                t0 = time.monotonic()
                 resp = await audiohub.get_audio_list()
+                print(f"TTS {tag} get_list_after: "
+                      f"{time.monotonic()-t0:.2f}s", flush=True)
                 audio_list = json.loads(
                     (resp.get("data") or {}).get("data", "{}")
                 ).get("audio_list", [])
