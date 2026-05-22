@@ -294,6 +294,7 @@ class RecogGreetingTask:
         phrases = [
             "Hello, I am Pella. What is your name?",
             "Sorry, I didn't catch your name.",
+            "Sorry, I cannot see you clearly.",
         ]
         if self._recognizer is not None:
             for name in getattr(self._recognizer, "known", {}):
@@ -750,7 +751,13 @@ class RecogGreetingTask:
             return result
         if (self._recog_best_face is None
                 or self._recog_best_face["sharpness"] < SHARPNESS_THRESHOLD):
-            self._queue_recovery(now, after_tts=False)
+            # Let the person know why we're not engaging. Voice the apology
+            # first so the wait_for_tts before recovery covers playback.
+            try:
+                self._say_queue.put_nowait("Sorry, I cannot see you clearly.")
+            except Exception:
+                pass
+            self._queue_recovery(now, after_tts=True)
             self._phase         = COOLDOWN
             self._phase_entered = now
             sharp_str = (f"{self._recog_best_face['sharpness']:.1f}"
