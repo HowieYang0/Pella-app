@@ -91,9 +91,14 @@ def _make_offline_surface(w: int, h: int) -> pygame.Surface:
 
 
 def _draw_transcript(screen, font, text: str, w: int, h: int):
-    """Render transcript text centred at the bottom of the screen."""
+    """Render heard-transcript text centred at the bottom of the screen.
+
+    Drawn in cyan to make it visually distinct from other overlays
+    (e.g. the green name labels in zoom views), reading as "this is
+    what Pella heard you say".
+    """
     padding = 12
-    surf  = font.render(text, True, (255, 255, 0))
+    surf  = font.render(text, True, (0, 255, 255))   # cyan = "heard"
     bg_w  = surf.get_width()  + padding * 2
     bg_h  = surf.get_height() + padding * 2
     bg    = pygame.Surface((bg_w, bg_h), pygame.SRCALPHA)

@@ -21,6 +21,7 @@ Surface to pella_main:
          the task consumed it.
 """
 
+import chat
 import recog_greeting
 from vision import load_recognizer
 
@@ -46,14 +47,40 @@ class TaskManager:
             recognizer, stop_event,
         )
 
+        # Retain a reference for routing chat replies (when neither the
+        # active task nor anything else consumed the transcript).
+        self._say_queue = say_queue
+
     def tick(self, now):
         """Run one iteration of whichever task is currently active."""
         return self._active_task.tick(now)
 
     def submit_transcript(self, now, text) -> bool:
-        """Forward a transcript line to the active task."""
-        return self._active_task.submit_transcript(now, text)
+        """Forward a transcript line to the active task, then to chat.
+
+        Cascade: the active task gets first dibs (e.g. recog_greeting may
+        be in INTRODUCING and waiting for a name). If the task doesn't
+        consume the line, chat.respond_to() is tried — when it returns
+        a reply string, we push it onto say_queue for TTS playback.
+        Returns True if anything handled the transcript.
+        """
+        if self._active_task.submit_transcript(now, text):
+            return True
+        reply = chat.respond_to(text)
+        if reply:
+            try:
+                self._say_queue.put_nowait(reply)
+            except Exception:
+                pass
+            print(f"Chat: {repr(text)} -> {repr(reply)}", flush=True)
+            return True
+        return False
 
     def get_warm_phrases(self) -> list:
-        """Collect phrases the active task wants pre-cached at startup."""
-        return self._active_task.get_warm_phrases()
+        """Collect phrases that pella_main should pre-cache at startup.
+
+        Pulls from both the active task (its known greetings + prompts)
+        and the chat module (its static replies). pella_main treats the
+        result as opaque strings.
+        """
+        return self._active_task.get_warm_phrases() + chat.get_warm_phrases()
