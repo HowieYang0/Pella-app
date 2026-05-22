@@ -26,7 +26,12 @@ SIT_HOLD_TIME        = 2.0    # min seconds to stay in sit_look_up (longer to se
 RECOVERY_SHARPNESS   = 50.0   # captured face must be at least this sharp to trigger recovery
 
 INTRODUCE_COOLDOWN   = 30.0   # seconds before asking an unknown face again
-ENROLL_TIMEOUT       = 15.0   # seconds to wait for a name before giving up
+ENROLL_TIMEOUT       = 25.0   # seconds to wait for a name before giving up.
+                              # Raised from 15 -> 25 to cover the worst-case
+                              # path: TTS plays (~3 s), user thinks + speaks
+                              # (~4 s), VAD silence trailer (1.2 s), Whisper
+                              # transcribes the clip (3-8 s). 15 s was firing
+                              # 2-9 s before the transcript actually arrived.
 SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
 
 # ── Model paths ────────────────────────────────────────────────────────────────

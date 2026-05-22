@@ -36,7 +36,13 @@ VAD_SPEECH_FRAMES     = 3      # consecutive speech frames to enter speech mode
 VAD_SILENCE_FRAMES    = 50     # consecutive silence frames to end utterance (~1 s)
 VAD_PRE_ROLL_FRAMES   = 8      # frames kept before onset to avoid clipping word starts
 MIN_SPEECH_SEC        = 0.8    # discard clips shorter than this
-MAX_SPEECH_SEC        = 15.0   # hard cap — long enough for multi-sentence utterances
+MAX_SPEECH_SEC        = 6.0    # hard cap. Reduced from 15 -> 6 for the new mic
+                               # bracket: LiDAR noise keeps the VAD in "speech"
+                               # mode continuously, so utterances were only
+                               # ever flushing at the 15 s cap. 6 s is enough
+                               # for "My name is William" + a beat of silence,
+                               # and the resulting clip transcribes in Whisper
+                               # in ~3-4 s instead of ~10.
 NOISE_FLOOR_EMA_ALPHA = 0.005  # slow EMA adaptation (~200 frames ≈ 4 s)
 NOISE_FLOOR_INIT      = 1500.0 # starting estimate for robot motor noise floor
 NOISE_FLOOR_FACTOR    = 1.4    # RMS must exceed floor × factor to count as speech
@@ -59,7 +65,12 @@ USB_NR_PROP_DECREASE   = 0.85    # aggressive NR — LiDAR/fan noise is very sta
 USB_VAD_SPEECH_FRAMES  = 2       # consecutive frames needed to enter speech mode (40 ms)
                                  # Lowered from 3 → 2 with new mic bracket so a
                                  # brief vowel onset enters speech mode faster.
-USB_VAD_SILENCE_FRAMES = 120     # consecutive frames needed to end utterance (~2.4 s @ 20 ms)
+USB_VAD_SILENCE_FRAMES = 60      # consecutive frames needed to end utterance (~1.2 s @ 20 ms)
+                                 # Reduced from 120 -> 60 with the new mic
+                                 # bracket — pauses between words register as
+                                 # silence often enough to flush the buffer
+                                 # within the enrollment window when there
+                                 # genuinely IS a name-shaped utterance.
 USB_PRE_ROLL_FRAMES    = 80      # audio kept before onset (~1.6 s) to capture soft sentence starts
 
 

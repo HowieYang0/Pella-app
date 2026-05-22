@@ -136,7 +136,14 @@ def _parse_name(text: str) -> str:
     """
     t = text.strip()
     t = re.split(r"[.!?]", t, maxsplit=1)[0].strip()
-    m = re.search(r"(?:i am|i'm|my name is)\s+(.+)", t, re.IGNORECASE)
+    # Handles the most common name-intro phrasings. The apostrophe-s
+    # contractions ("my name's", "name's") show up frequently in
+    # Whisper transcripts even when the speaker said the full "my name is".
+    m = re.search(
+        r"(?:i am|i'm|i'?m\s+called|my\s+name\s+is|my\s+name'?s|name'?s|"
+        r"call\s+me|this\s+is)\s+(.+)",
+        t, re.IGNORECASE,
+    )
     if m:
         t = m.group(1).strip()
     courtesy = (
