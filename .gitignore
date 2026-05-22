@@ -23,6 +23,8 @@ venv/
 # Accidental save with a whitespace-only filename — leftover artifact
 " "
 
-# Large binaries — not tracked here (managed externally / git-lfs later)
-models/
-audio/
+# Large ML model checkpoint — only the small YuNet detector is tracked;
+# the ArcFace model (~170 MB) lives only on the robot, downloaded out of band.
+data/models/w600k_r50.onnx
+data/models/res10_300x300_ssd_iter_140000.caffemodel
+data/models/deploy.prototxt

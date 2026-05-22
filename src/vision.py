@@ -47,12 +47,16 @@ ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
 SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
 
 # ── Model paths ────────────────────────────────────────────────────────────────
+# _DIR is .../pella_app/src/. Model checkpoints + enrollment data live under
+# the repo's data/ tree (sibling of src/), so model & face paths resolve
+# through ../data/.
 _DIR         = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR   = os.path.join(_DIR, "models")
+DATA_DIR     = os.path.join(_DIR, "..", "data")
+MODELS_DIR   = os.path.join(DATA_DIR, "models")
 YUNET_PATH   = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
 _PROTO       = os.path.join(MODELS_DIR, "deploy.prototxt")
 _WEIGHTS     = os.path.join(MODELS_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
-FACE_IDS_DIR = os.path.join(_DIR, "..", "data", "face_ids")
+FACE_IDS_DIR = os.path.join(DATA_DIR, "face_ids")
 
 # ── Detector initialisation ───────────────────────────────────────────────────
 if os.path.exists(YUNET_PATH) and hasattr(cv2, "FaceDetectorYN"):
@@ -240,7 +244,7 @@ def load_recognizer():
     try:
         from face_recognizer import FaceRecognizer
         model_path   = os.path.join(MODELS_DIR, "w600k_r50.onnx")
-        face_ids_dir = os.path.join(_DIR, "..", "data", "face_ids")
+        face_ids_dir = FACE_IDS_DIR
         if not os.path.exists(model_path):
             print("ArcFace model not found — recognition disabled", flush=True)
             return None

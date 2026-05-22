@@ -11,7 +11,7 @@ Environment=XAUTHORITY=/home/pella/.Xauthority
 # and dropped between visible lines.
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/home/pella/Development/pella/pella_app
-ExecStart=/home/pella/Development/pella/pella_app/.venv/bin/python pella_main.py 192.168.123.161
+ExecStart=/home/pella/Development/pella/pella_app/.venv/bin/python src/pella_main.py 192.168.123.161
 Restart=always
 RestartSec=5
 
