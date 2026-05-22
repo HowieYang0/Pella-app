@@ -29,11 +29,13 @@ from stt import TTS_MUTE_SEC, tts_mute_until
 
 # ── WAV generation ───────────────────────────────────────────────────────────
 
-def _generate_wav(text: str, text_hash: str) -> str:
-    """Convert text to a 44.1 kHz WAV via gTTS. Returns the file path.
+def _generate_wav(text: str, text_hash: str):
+    """Convert text to a 44.1 kHz WAV via gTTS. Returns (path, duration_sec).
 
     Runs on a worker thread (called via run_in_executor) because gTTS makes
-    blocking HTTP requests to Google's TTS service.
+    blocking HTTP requests to Google's TTS service. The duration is needed
+    by the caller to size the TTS-mute window so the USB mic doesn't
+    capture (and re-transcribe) Pella's own speech.
     """
     from gtts import gTTS
     mp3_path = f"/tmp/pella_{text_hash}.mp3"
@@ -42,7 +44,29 @@ def _generate_wav(text: str, text_hash: str) -> str:
     sound = AudioSegment.from_mp3(mp3_path).set_frame_rate(44100)
     sound.export(out_path, format="wav")
     os.unlink(mp3_path)
-    return out_path
+    return out_path, len(sound) / 1000.0
+
+
+def _wav_duration(path: str) -> float:
+    """Read duration in seconds from a WAV file. 0.0 on failure.
+
+    Used when a cache entry already has a path (e.g. recovered from a
+    previous run) but no recorded duration yet.
+    """
+    import wave
+    try:
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / w.getframerate()
+    except Exception:
+        return 0.0
+
+
+# How much extra to add on top of the WAV duration when sizing the mute.
+# Covers: play_by_uuid request acknowledge (~0.2 s) + speaker buffering
+# (~0.3 s) + room reverb tail (~0.5 s). Generous on purpose — mute lifting
+# slightly late costs a fraction of a second of listening; lifting too early
+# costs a self-hear and a bogus transcript.
+MUTE_BUFFER_SEC = 1.0
 
 
 # ── Playback ─────────────────────────────────────────────────────────────────
@@ -65,17 +89,25 @@ async def speak(text: str, audiohub, cache: dict):
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         file_name = f"pella_{text_hash}"
-        entry = cache.setdefault(text_hash, {"path": None, "uuid": None})
+        entry = cache.setdefault(
+            text_hash, {"path": None, "uuid": None, "duration": 0.0}
+        )
         preview = (text[:60] + "…") if len(text) > 60 else text
         tag = f"[{text_hash}]"
 
         if entry["path"] is None:
             t0 = time.monotonic()
-            entry["path"] = await asyncio.get_event_loop().run_in_executor(
-                None, _generate_wav, text, text_hash
+            entry["path"], entry["duration"] = (
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _generate_wav, text, text_hash
+                )
             )
             print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
+                  f"({entry['duration']:.2f}s audio) "
                   f"{repr(preview)}", flush=True)
+        elif not entry.get("duration"):
+            # Recovered path with no duration recorded — read from the WAV.
+            entry["duration"] = _wav_duration(entry["path"])
 
         if entry["uuid"] is None:
             t0 = time.monotonic()
@@ -110,10 +142,19 @@ async def speak(text: str, audiohub, cache: dict):
                     break
 
         if entry["uuid"]:
-            mute_t = time.monotonic() + TTS_MUTE_SEC
+            # Mute the USB mic for the actual audio length + a safety buffer.
+            # Fixed TTS_MUTE_SEC was 4 s, which under-covered long utterances
+            # like "Hello, I am Pella. What is your name?" (~3.5 s audio +
+            # ~0.5 s playback latency), causing the tail to leak into the
+            # mic and be re-transcribed as "Pella".
+            mute_dur = max(
+                entry.get("duration", 0.0) + MUTE_BUFFER_SEC,
+                TTS_MUTE_SEC,  # never shorter than the legacy floor
+            )
+            mute_t = time.monotonic() + mute_dur
             tts_mute_until[0] = mute_t   # USB-mic path reads this to self-mute
             print(f"TTS {tag} playing {repr(preview)} "
-                  f"(mute until +{TTS_MUTE_SEC:.1f}s)", flush=True)
+                  f"(mute until +{mute_dur:.1f}s)", flush=True)
             t0 = time.monotonic()
             await audiohub.play_by_uuid(entry["uuid"])
             print(f"TTS {tag} play_by_uuid_call: "
@@ -141,17 +182,24 @@ async def prepare(text: str, audiohub, cache: dict):
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         file_name = f"pella_{text_hash}"
-        entry = cache.setdefault(text_hash, {"path": None, "uuid": None})
+        entry = cache.setdefault(
+            text_hash, {"path": None, "uuid": None, "duration": 0.0}
+        )
         preview = (text[:50] + "…") if len(text) > 50 else text
         tag = f"[{text_hash} prep]"
 
         if entry["path"] is None:
             t0 = time.monotonic()
-            entry["path"] = await asyncio.get_event_loop().run_in_executor(
-                None, _generate_wav, text, text_hash
+            entry["path"], entry["duration"] = (
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _generate_wav, text, text_hash
+                )
             )
             print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
+                  f"({entry['duration']:.2f}s audio) "
                   f"{repr(preview)}", flush=True)
+        elif not entry.get("duration"):
+            entry["duration"] = _wav_duration(entry["path"])
 
         if entry["uuid"] is None:
             t0 = time.monotonic()
