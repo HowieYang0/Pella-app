@@ -25,7 +25,11 @@ ASR_SAMPLE_RATE       = 16000
 TTS_MUTE_SEC          = 4.0    # mute mic this long after TTS plays
 SPEAKER_VOLUME        = 7      # robot speaker volume 0–10
 
-VAD_AGGRESSIVENESS    = 3      # webrtcvad: 0 = permissive, 3 = strict
+VAD_AGGRESSIVENESS    = 1      # webrtcvad: 0 = permissive, 3 = strict
+                               # Lowered from 3 → 1 after new mic bracket
+                               # introduced LiDAR-pulse background; at level 3
+                               # webrtcvad was rejecting voice frames as
+                               # "not speech enough" amid the noise.
 VAD_FRAME_MS          = 20     # webrtcvad frame size (10, 20, or 30 ms)
 VAD_FRAME_SAMPLES     = int(VAD_FRAME_MS / 1000 * ROBOT_SAMPLE_RATE)  # 960 @ 48 kHz
 VAD_SPEECH_FRAMES     = 3      # consecutive speech frames to enter speech mode
@@ -44,12 +48,17 @@ USB_MIC_DEVICE_NAME   = "Samson" # substring match against PyAudio device names
 USB_MIC_SAMPLE_RATE   = 16000    # capture at ASR rate — no resampling needed
 USB_MIC_CHANNELS      = 1
 USB_NOISE_FLOOR_INIT   = 300.0   # lower starting estimate — no motors on the dock
-USB_NOISE_FLOOR_FACTOR = 1.5     # RMS entry threshold; speech at 3ft peaks well above floor×1.5
+USB_NOISE_FLOOR_FACTOR = 1.2     # RMS entry threshold; speech at 3ft peaks well above floor×factor
+                                 # Lowered from 1.5 → 1.2 with new mic bracket
+                                 # so voice frames clear the entry threshold
+                                 # despite a low (327ish) ambient floor.
 USB_SILENCE_HOLD_FACTOR = 1.8   # hysteresis: only resets silence counter for strong speech
 USB_SPIKE_REJECT       = 8       # skip frames above this × floor (LiDAR impacts, physical contact)
 USB_WARMUP_FRAMES      = 100     # ~2 s fast-adapt then normal EMA
 USB_NR_PROP_DECREASE   = 0.85    # aggressive NR — LiDAR/fan noise is very stationary
-USB_VAD_SPEECH_FRAMES  = 3       # consecutive frames needed to enter speech mode (60 ms)
+USB_VAD_SPEECH_FRAMES  = 2       # consecutive frames needed to enter speech mode (40 ms)
+                                 # Lowered from 3 → 2 with new mic bracket so a
+                                 # brief vowel onset enters speech mode faster.
 USB_VAD_SILENCE_FRAMES = 120     # consecutive frames needed to end utterance (~2.4 s @ 20 ms)
 USB_PRE_ROLL_FRAMES    = 80      # audio kept before onset (~1.6 s) to capture soft sentence starts
 
