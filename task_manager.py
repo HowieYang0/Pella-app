@@ -55,8 +55,14 @@ class TaskManager:
         """Run one iteration of whichever task is currently active."""
         return self._active_task.tick(now)
 
-    def submit_transcript(self, now, text) -> bool:
+    def submit_transcript(self, now, text, capture_t) -> bool:
         """Forward a transcript line to the active task, then to chat.
+
+        `capture_t` is the monotonic time the user actually started
+        speaking (stamped by stt.py when VAD entered speech mode), not
+        the time the transcript arrived from Whisper. Tasks use this
+        to match speech against listening windows that can be much
+        shorter than the worst-case transcription latency.
 
         Cascade: the active task gets first dibs (e.g. recog_greeting may
         be in INTRODUCING and waiting for a name). If the task doesn't
@@ -64,7 +70,7 @@ class TaskManager:
         a reply string, we push it onto say_queue for TTS playback.
         Returns True if anything handled the transcript.
         """
-        if self._active_task.submit_transcript(now, text):
+        if self._active_task.submit_transcript(now, text, capture_t):
             return True
         reply = chat.respond_to(text)
         if reply:

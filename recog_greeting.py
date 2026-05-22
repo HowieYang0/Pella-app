@@ -42,7 +42,8 @@ import actions
 import face_recognizer
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
-    INTRODUCE_COOLDOWN, ENROLL_TIMEOUT, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
+    INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_TIMEOUT, FACE_IDS_DIR,
+    SHARPNESS_THRESHOLD,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
@@ -366,13 +367,38 @@ class RecogGreetingTask:
 
     # ── Transcript handoff (called from pella_main's transcript handler) ─
 
-    def submit_transcript(self, now, text) -> bool:
+    def submit_transcript(self, now, text, capture_t) -> bool:
         """Drive enrollment if we're INTRODUCING and waiting for a name.
+
+        `capture_t` is the monotonic time the user actually started
+        speaking (stamped by stt.py at VAD-speech-start), not the time
+        the transcript arrived. We accept transcripts whose capture_t
+        falls inside [asked_at, asked_at + ENROLL_LISTEN_WINDOW], so a
+        slow Whisper transcription doesn't kill an enrollment whose
+        speech was timely.
 
         Returns True if the task consumed the transcript (pella_main can
         treat it as handled). False otherwise.
         """
         if not self._enroll_state["active"]:
+            return False
+
+        asked_at = self._enroll_state["asked_at"]
+        if capture_t < asked_at:
+            # Speech was captured before we asked — leftover from the
+            # previous window. Ignore without consuming.
+            print(f"Task[recog_greeting]: ignoring transcript "
+                  f"(captured {asked_at - capture_t:.1f}s before intro): "
+                  f"{repr(text)}", flush=True)
+            return False
+        if capture_t > asked_at + ENROLL_LISTEN_WINDOW:
+            # User started speaking after the listening window closed.
+            # Don't enroll them, but consume the transcript so chat
+            # doesn't also try to answer it.
+            print(f"Task[recog_greeting]: ignoring transcript "
+                  f"(captured {capture_t - asked_at:.1f}s after intro, "
+                  f"outside {ENROLL_LISTEN_WINDOW:.0f}s window): "
+                  f"{repr(text)}", flush=True)
             return False
 
         name_raw = _parse_name(text)

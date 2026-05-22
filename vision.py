@@ -26,12 +26,19 @@ SIT_HOLD_TIME        = 2.0    # min seconds to stay in sit_look_up (longer to se
 RECOVERY_SHARPNESS   = 50.0   # captured face must be at least this sharp to trigger recovery
 
 INTRODUCE_COOLDOWN   = 30.0   # seconds before asking an unknown face again
-ENROLL_TIMEOUT       = 25.0   # seconds to wait for a name before giving up.
-                              # Raised from 15 -> 25 to cover the worst-case
-                              # path: TTS plays (~3 s), user thinks + speaks
-                              # (~4 s), VAD silence trailer (1.2 s), Whisper
-                              # transcribes the clip (3-8 s). 15 s was firing
-                              # 2-9 s before the transcript actually arrived.
+ENROLL_LISTEN_WINDOW = 10.0   # seconds after intro during which the user is
+                              # expected to start speaking their name. A
+                              # transcript whose VAD speech-start timestamp
+                              # falls inside this window counts; later
+                              # speech does not.
+ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
+                              # abandoned even if no transcript arrived.
+                              # Larger than ENROLL_LISTEN_WINDOW to absorb
+                              # the worst-case Whisper transcription latency
+                              # for a user who spoke just before the window
+                              # closed: ~10s of capture + ~6s of MAX_SPEECH
+                              # buffer + ~10s of CPU-Whisper = ~26s, so 30
+                              # gives a small safety margin.
 SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
 
 # ── Model paths ────────────────────────────────────────────────────────────────

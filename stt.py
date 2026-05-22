@@ -268,20 +268,29 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
         "frame_count":   0,
         "max_rms":       0.0,
         "noise_floor":   USB_NOISE_FLOOR_INIT,
+        "speech_start_t": 0.0,   # monotonic time the user actually started
+                                 # speaking. Stamped on each transcript so
+                                 # downstream consumers can decide if the
+                                 # speech fell inside a listening window —
+                                 # robust to Whisper transcription latency.
     }
     max_samples = int(MAX_SPEECH_SEC * USB_MIC_SAMPLE_RATE)
     min_samples = int(MIN_SPEECH_SEC * USB_MIC_SAMPLE_RATE)
 
     def _flush():
-        samples = np.array(list(vad["buf"]), dtype=np.int16)
+        samples         = np.array(list(vad["buf"]), dtype=np.int16)
+        speech_start_t  = vad["speech_start_t"]
         vad["buf"].clear()
         vad["in_speech"]       = False
         vad["speech_frames"]   = 0
         vad["silence_frames"]  = 0
         vad["speech_samples"]  = 0
+        vad["speech_start_t"]  = 0.0
         if len(samples) < min_samples:
             return
-        print(f"ASR: sending {len(samples) / USB_MIC_SAMPLE_RATE:.1f}s of audio",
+        clip_sec = len(samples) / USB_MIC_SAMPLE_RATE
+        print(f"ASR: sending {clip_sec:.1f}s of audio "
+              f"(speech started {time.monotonic() - speech_start_t:.1f}s ago)",
               flush=True)
 
         def _run():
@@ -290,7 +299,7 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
             if text:
                 print(f"Heard: {text}", flush=True)
                 try:
-                    transcript_queue.put_nowait(text)
+                    transcript_queue.put_nowait((text, speech_start_t))
                 except Exception:
                     pass
             else:
@@ -353,7 +362,11 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                     if len(vad["buf"]) >= max_samples:
                         _flush()
                 elif vad["speech_frames"] >= USB_VAD_SPEECH_FRAMES:
-                    vad["in_speech"] = True
+                    vad["in_speech"]      = True
+                    # Stamp as soon as VAD commits to "this is speech" —
+                    # the timestamp travels with the transcript so the
+                    # consumer can match user-speech-time, not arrival-time.
+                    vad["speech_start_t"] = time.monotonic()
                     for pre in vad["pre_roll"]:
                         vad["buf"].extend(pre)
                         vad["speech_samples"] += len(pre)
