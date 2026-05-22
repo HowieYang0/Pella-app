@@ -26,6 +26,11 @@ SIT_HOLD_TIME        = 2.0    # min seconds to stay in sit_look_up (longer to se
 RECOVERY_SHARPNESS   = 50.0   # captured face must be at least this sharp to trigger recovery
 
 INTRODUCE_COOLDOWN   = 30.0   # seconds before asking an unknown face again
+CORRECTION_WINDOW    = 10.0   # seconds after Pella greets/introduces a person
+                              # during which a transcript starting with an
+                              # explicit intro phrase ("my name is X") is
+                              # treated as a name correction and triggers a
+                              # rename on disk + in the recognizer.
 ENROLL_LISTEN_WINDOW = 10.0   # seconds after intro during which the user is
                               # expected to start speaking their name. A
                               # transcript whose VAD speech-start timestamp

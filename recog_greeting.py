@@ -42,8 +42,8 @@ import actions
 import face_recognizer
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
-    INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_TIMEOUT, FACE_IDS_DIR,
-    SHARPNESS_THRESHOLD,
+    INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_TIMEOUT,
+    CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
@@ -126,14 +126,24 @@ _NON_NAME_WORDS = {
     # Polite / imperative words seen in mis-captures
     "please", "thanks", "thank", "sorry",
     "stop", "hold", "wait", "excuse", "tell", "give", "take",
+    # Common state replies after "I'm X" — would otherwise be mis-parsed
+    # as a name correction by the intro-phrase branch.
+    "fine", "good", "great", "well", "alright", "tired", "busy",
+    "happy", "sad", "lost", "here", "back", "home", "ready",
 }
 
 
-def _parse_name(text: str) -> str:
+def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
     """Extract a name from a casual reply, ignoring courtesy phrases.
 
     Returns an empty string when the input doesn't look like a name — e.g.
     contains common non-name words like 'excuse me' or 'hold it for me'.
+
+    When `require_intro_phrase=True`, only matches with an explicit
+    "my name is X" / "I am X" / "call me X" / etc. — bare names are
+    rejected. Used for *corrections* to a stored name: a casual reply
+    like "I'm fine, thanks" right after a greeting shouldn't accidentally
+    rename the person.
     """
     t = text.strip()
     t = re.split(r"[.!?]", t, maxsplit=1)[0].strip()
@@ -147,6 +157,8 @@ def _parse_name(text: str) -> str:
     )
     if m:
         t = m.group(1).strip()
+    elif require_intro_phrase:
+        return ""
     courtesy = (
         r",|\s+and\b|"
         r"\s+(?:nice|glad|pleased|happy)\s+(?:to\s+)?(?:meet|meeting)\b"
@@ -290,6 +302,18 @@ class RecogGreetingTask:
             "bbox":   None,  "asked_at": 0.0, "best_sharpness": 0.0,
         }
 
+        # Correction state: after Pella greets/introduces someone, the user
+        # has CORRECTION_WINDOW seconds to say "my name is X" to rename them.
+        # `opened_at` is the monotonic time the window was opened (which is
+        # also the earliest accepted capture_t, so corrections shouted before
+        # the greeting played don't count).
+        self._correction_state = {
+            "active": False,
+            "dir_name": None,        # canonical key under face_ids/
+            "display_name": None,    # human-readable form Pella said
+            "opened_at": 0.0,
+        }
+
     # ── TTS pre-warm ─────────────────────────────────────────────────────
 
     def get_warm_phrases(self) -> list:
@@ -368,7 +392,9 @@ class RecogGreetingTask:
     # ── Transcript handoff (called from pella_main's transcript handler) ─
 
     def submit_transcript(self, now, text, capture_t) -> bool:
-        """Drive enrollment if we're INTRODUCING and waiting for a name.
+        """Drive enrollment if we're INTRODUCING and waiting for a name,
+        or rename the just-addressed person if we're in a correction
+        window after a greeting/enrollment.
 
         `capture_t` is the monotonic time the user actually started
         speaking (stamped by stt.py at VAD-speech-start), not the time
@@ -380,6 +406,34 @@ class RecogGreetingTask:
         Returns True if the task consumed the transcript (pella_main can
         treat it as handled). False otherwise.
         """
+        # Correction takes precedence over enrollment: if Pella just said
+        # "Nice to meet you, Willie!" and the user replies "My name is
+        # William.", we want to rename, not start a fresh enrollment.
+        if self._correction_state["active"]:
+            opened = self._correction_state["opened_at"]
+            if capture_t < opened:
+                pass  # speech was before the greeting; fall through
+            elif capture_t > opened + CORRECTION_WINDOW:
+                # Window expired — close it and fall through to normal
+                # handling (which will reject the transcript at the
+                # enrollment check below, since enroll is not active).
+                self._correction_state["active"] = False
+            else:
+                new_name = _parse_name(text, require_intro_phrase=True)
+                if new_name:
+                    old_dir = self._correction_state["dir_name"]
+                    new_dir = new_name.lower().replace(" ", "_")
+                    if new_dir != old_dir:
+                        if self._apply_correction(new_name):
+                            self._correction_state["active"] = False
+                            return True
+                    # Same name — user confirmed; just close the window.
+                    self._correction_state["active"] = False
+                    return True
+                # No intro phrase parsed inside the window — leave the
+                # window open in case another transcript arrives soon
+                # (e.g. user clarifies). Don't consume; fall through.
+
         if not self._enroll_state["active"]:
             return False
 
@@ -465,6 +519,79 @@ class RecogGreetingTask:
             print(f"Task[recog_greeting]: "
                   f"{'enrolled' if enrolled else 'rejected'}: {display_name} "
                   f"(say_queue full? {e})", flush=True)
+        if enrolled:
+            # Open the correction window so a follow-up "My name is X"
+            # can rename a mishear (e.g. "Willie" -> "William").
+            self._open_correction_window(now, dir_name, display_name)
+        return True
+
+    # ── Correction window ────────────────────────────────────────────────
+
+    def _open_correction_window(self, now, dir_name, display_name):
+        """Open a CORRECTION_WINDOW-second window after Pella addressed
+        someone, during which an explicit name intro renames them.
+
+        Called after both:
+          * "Hi, X." (greeting of a recognised person)
+          * "Nice to meet you, X!" (successful enrollment)
+        """
+        self._correction_state.update({
+            "active":       True,
+            "dir_name":     dir_name,
+            "display_name": display_name,
+            "opened_at":    now,
+        })
+
+    def _apply_correction(self, new_name_raw: str):
+        """Rename the just-addressed person to `new_name_raw` and say so.
+
+        Handles both the rename on disk + in the recognizer, and updates
+        the in-memory per-name cooldown so the rename doesn't make the
+        person eligible for an immediate re-greeting under the new name.
+        """
+        old_dir  = self._correction_state["dir_name"]
+        new_dir  = new_name_raw.lower().replace(" ", "_")
+        new_disp = new_name_raw.title()
+        if old_dir == new_dir:
+            return False
+
+        if self._recognizer is not None:
+            self._recognizer.rename(old_dir, new_dir)
+        else:
+            # Fallback: directory move without an embedding map.
+            import shutil
+            src = os.path.join(FACE_IDS_DIR, old_dir)
+            dst = os.path.join(FACE_IDS_DIR, new_dir)
+            if os.path.isdir(src) and not os.path.isdir(dst):
+                os.rename(src, dst)
+            elif os.path.isdir(src) and os.path.isdir(dst):
+                # Merge by best-effort copy then remove
+                for fname in os.listdir(src):
+                    shutil.move(os.path.join(src, fname), dst)
+                try:
+                    os.rmdir(src)
+                except OSError:
+                    pass
+
+        # Carry the per-name cooldown over so we don't re-greet under
+        # the new name in the next tick.
+        if old_dir in self._last_greeted:
+            self._last_greeted[new_dir] = self._last_greeted.pop(old_dir)
+
+        # Pre-warm TTS for the new name (most likely the next greeting).
+        for prep_text in (f"Hi, {new_disp}", f"Nice to meet you, {new_disp}!"):
+            try:
+                self._prep_queue.put_nowait(prep_text)
+            except Exception:
+                pass
+
+        try:
+            self._say_queue.put_nowait(f"Sorry, {new_disp}. Got it.")
+        except Exception:
+            pass
+
+        print(f"Task[recog_greeting]: corrected '{old_dir}' -> '{new_dir}'",
+              flush=True)
         return True
 
     # ── SENSE helpers ────────────────────────────────────────────────────
@@ -761,6 +888,7 @@ class RecogGreetingTask:
         self._phase          = GREETING
         self._phase_entered  = now
         result.status_event  = STATUS_KNOWN_PERSON
+        self._open_correction_window(now, verdict, display_name)
         print(f"Task[recog_greeting]: greeting {display_name}", flush=True)
         return result
 

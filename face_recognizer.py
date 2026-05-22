@@ -77,6 +77,7 @@ class FaceRecognizer:
                  enroll_threshold: float = 0.50):
         self.threshold        = threshold
         self.enroll_threshold = enroll_threshold
+        self.face_ids_dir     = face_ids_dir  # needed by rename()
         self.session = ort.InferenceSession(
             model_path, providers=["CPUExecutionProvider"]
         )
@@ -193,6 +194,65 @@ class FaceRecognizer:
 
         print(f"[FaceRecognizer] enrolled '{name}' "
               f"({len(self.known[name])} embedding(s))", flush=True)
+        return True
+
+    def rename(self, old_name: str, new_name: str) -> bool:
+        """Rename a person on disk and in memory.
+
+        If `new_name` already exists, merges `old_name`'s files into it
+        with next-index numbering (preserves jpg/npy pairs). Otherwise
+        does a plain directory rename. Returns True on success.
+
+        Used by recog_greeting when the user corrects a mis-heard name
+        ("My name is William" after Pella said "Hi, Willie").
+        """
+        if old_name == new_name:
+            return False
+
+        old_dir = os.path.join(self.face_ids_dir, old_name)
+        new_dir = os.path.join(self.face_ids_dir, new_name)
+
+        if os.path.isdir(old_dir):
+            if not os.path.isdir(new_dir):
+                os.rename(old_dir, new_dir)
+            else:
+                # Merge: copy each NNN.jpg + NNN.npy pair into new_dir at
+                # next available index. Files are processed stem-by-stem
+                # so a .jpg/.npy pair stays together under the same new
+                # number.
+                next_idx = next_image_index(new_dir)
+                files_by_stem: dict = {}
+                for fname in os.listdir(old_dir):
+                    stem, ext = os.path.splitext(fname)
+                    if ext.lower() in (".jpg", ".jpeg", ".png", ".npy"):
+                        files_by_stem.setdefault(stem, []).append(fname)
+                for stem in sorted(files_by_stem.keys()):
+                    for fname in files_by_stem[stem]:
+                        _, ext = os.path.splitext(fname)
+                        os.rename(
+                            os.path.join(old_dir, fname),
+                            os.path.join(new_dir, f"{next_idx:03d}{ext.lower()}"),
+                        )
+                    next_idx += 1
+                # Best-effort cleanup of the now-empty old dir.
+                try:
+                    for fname in os.listdir(old_dir):
+                        os.remove(os.path.join(old_dir, fname))
+                    os.rmdir(old_dir)
+                except OSError as e:
+                    print(f"[FaceRecognizer] rename: could not remove "
+                          f"{old_dir}: {e}", flush=True)
+
+        # In-memory map.
+        if old_name in self.known:
+            if new_name in self.known:
+                self.known[new_name].extend(self.known.pop(old_name))
+            else:
+                self.known[new_name] = self.known.pop(old_name)
+
+        print(f"[FaceRecognizer] renamed '{old_name}' -> '{new_name}' "
+              f"({len(self.known.get(new_name, []))} embedding(s))",
+              flush=True)
         return True
 
     def recognize(self, bgr_frame: np.ndarray,
