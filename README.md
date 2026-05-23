@@ -156,6 +156,46 @@ The systemd journal (`journalctl -u pella-camera`) is the canonical place
 to read Pella's behaviour — the program logs every state transition,
 TTS playback, ASR result, and recognition event with a timestamp.
 
+## Deploying laptop → robot
+
+Two helper scripts under `scripts/` handle pushing code from a developer
+laptop to the robot dock.
+
+### First time: `scripts/migrate-robot.sh`
+
+Run once, after the first checkout of this repo on the dock OR after the
+laptop's repo was reshuffled into `src/ tests/ data/` layout. It:
+
+1. Moves any sibling `…/pella/data/face_ids/` into `pella_app/data/face_ids/`
+   so the in-repo `data/` tree owns the live enrollment data.
+2. Deletes the old flat-layout `.py` files at `pella_app/` root that have
+   since moved into `src/` or `tests/` (otherwise the next rsync would
+   leave both copies side by side).
+3. Symlinks `pella-camera.service` into `/etc/systemd/system/` so future
+   service-file edits land automatically — no `sudo cp` needed.
+
+```bash
+PELLA_ROBOT_HOST=unitree@<dock-ip> scripts/migrate-robot.sh
+```
+
+### Every time: `scripts/push.sh`
+
+Run whenever you want to deploy a code change. Uses rsync with
+`--checksum --delete`, then restarts `pella-camera` on the dock.
+
+```bash
+PELLA_ROBOT_HOST=unitree@<dock-ip> scripts/push.sh
+```
+
+The robot's `.venv/`, `.env`, live enrollment data under
+`data/face_ids/`, and the large ArcFace checkpoint
+(`data/models/w600k_r50.onnx`) are all excluded — they live on the robot
+only and aren't overwritten.
+
+Both scripts also accept `PELLA_ROBOT_PATH=...` (defaults to
+`/home/unitree/Development/pella/pella_app`) and `push.sh` accepts
+`PELLA_SKIP_RESTART=1` to push without bouncing the service.
+
 ## Adding a person without using the live enrolment flow
 
 Drop one or more face crops under `data/face_ids/<name>/`:
