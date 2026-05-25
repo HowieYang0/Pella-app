@@ -36,6 +36,15 @@ ENROLL_LISTEN_WINDOW = 10.0   # seconds after intro during which the user is
                               # transcript whose VAD speech-start timestamp
                               # falls inside this window counts; later
                               # speech does not.
+ENROLL_LOOKBACK_SEC  = 3.0    # accept speech started up to this many seconds
+                              # *before* intro. Users often anticipate the
+                              # question and start answering as the prompt is
+                              # still playing — without this allowance,
+                              # transcripts with speech_start_t just before
+                              # asked_at would be rejected even though they
+                              # are the real answer. _parse_name's strict
+                              # mode still requires "my name is X" / "I am X"
+                              # so random pre-question chatter won't pass.
 ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
                               # abandoned even if no transcript arrived.
                               # Larger than ENROLL_LISTEN_WINDOW to absorb

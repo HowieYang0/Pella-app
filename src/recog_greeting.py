@@ -42,8 +42,8 @@ import actions
 import face_recognizer
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
-    INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_TIMEOUT,
-    CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
+    INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
+    ENROLL_TIMEOUT, CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
@@ -438,11 +438,12 @@ class RecogGreetingTask:
             return False
 
         asked_at = self._enroll_state["asked_at"]
-        if capture_t < asked_at:
-            # Speech was captured before we asked — leftover from the
+        if capture_t < asked_at - ENROLL_LOOKBACK_SEC:
+            # Speech was captured well before we asked — leftover from a
             # previous window. Ignore without consuming.
             print(f"Task[recog_greeting]: ignoring transcript "
-                  f"(captured {asked_at - capture_t:.1f}s before intro): "
+                  f"(captured {asked_at - capture_t:.1f}s before intro, "
+                  f"outside {ENROLL_LOOKBACK_SEC:.0f}s lookback): "
                   f"{repr(text)}", flush=True)
             return False
         if capture_t > asked_at + ENROLL_LISTEN_WINDOW:
