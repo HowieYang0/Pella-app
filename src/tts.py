@@ -69,6 +69,30 @@ def _wav_duration(path: str) -> float:
 MUTE_BUFFER_SEC = 1.0
 
 
+def _get_or_create_entry(cache: dict, text_hash: str) -> dict:
+    """Return the cache entry for `text_hash`, creating it (with a fresh
+    asyncio.Lock) if it doesn't exist yet.
+
+    The lock serialises the gen_wav + audiohub-upload phases across
+    concurrent callers (speak() vs prepare(), or two prepare()s) racing
+    on the same text. Without it, both callers run `gTTS().save(mp3)`
+    against the same /tmp path, one os.unlinks while the other is still
+    reading, and ffmpeg fails to decode.
+
+    Lock creation has to happen inside a running asyncio loop (Python 3.8+
+    semantics), so we only create it on first access from within an
+    async function — never at module import time.
+    """
+    entry = cache.get(text_hash)
+    if entry is None:
+        entry = {
+            "path": None, "uuid": None, "duration": 0.0,
+            "lock": asyncio.Lock(),
+        }
+        cache[text_hash] = entry
+    return entry
+
+
 # ── Playback ─────────────────────────────────────────────────────────────────
 
 async def speak(text: str, audiohub, cache: dict):
@@ -89,57 +113,61 @@ async def speak(text: str, audiohub, cache: dict):
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         file_name = f"pella_{text_hash}"
-        entry = cache.setdefault(
-            text_hash, {"path": None, "uuid": None, "duration": 0.0}
-        )
+        entry = _get_or_create_entry(cache, text_hash)
         preview = (text[:60] + "…") if len(text) > 60 else text
         tag = f"[{text_hash}]"
 
-        if entry["path"] is None:
-            t0 = time.monotonic()
-            entry["path"], entry["duration"] = (
-                await asyncio.get_event_loop().run_in_executor(
-                    None, _generate_wav, text, text_hash
+        # Serialise the gen_wav + upload phases against concurrent callers
+        # for the same text_hash. Without this, prepare() and speak()
+        # racing on "Nice to meet you, William!" would both call gen_wav,
+        # collide on /tmp/pella_<hash>.mp3 (the first os.unlinks it while
+        # the second is still reading), and ffmpeg fails decoding.
+        async with entry["lock"]:
+            if entry["path"] is None:
+                t0 = time.monotonic()
+                entry["path"], entry["duration"] = (
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _generate_wav, text, text_hash
+                    )
                 )
-            )
-            print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
-                  f"({entry['duration']:.2f}s audio) "
-                  f"{repr(preview)}", flush=True)
-        elif not entry.get("duration"):
-            # Recovered path with no duration recorded — read from the WAV.
-            entry["duration"] = _wav_duration(entry["path"])
+                print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
+                      f"({entry['duration']:.2f}s audio) "
+                      f"{repr(preview)}", flush=True)
+            elif not entry.get("duration"):
+                # Recovered path with no duration recorded — read from the WAV.
+                entry["duration"] = _wav_duration(entry["path"])
 
-        if entry["uuid"] is None:
-            t0 = time.monotonic()
-            resp = await audiohub.get_audio_list()
-            print(f"TTS {tag} get_list_before: {time.monotonic()-t0:.2f}s",
-                  flush=True)
-            audio_list = json.loads(
-                (resp.get("data") or {}).get("data", "{}")
-            ).get("audio_list", [])
-            for item in audio_list:
-                if item.get("CUSTOM_NAME") == file_name:
-                    t0 = time.monotonic()
-                    await audiohub.delete_record(item["UNIQUE_ID"])
-                    print(f"TTS {tag} delete_old: "
-                          f"{time.monotonic()-t0:.2f}s", flush=True)
-                    break
-            t0 = time.monotonic()
-            with contextlib.redirect_stdout(io.StringIO()):
-                await audiohub.upload_audio_file(entry["path"])
-            print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
-                  f"({os.path.getsize(entry['path'])} bytes)", flush=True)
-            t0 = time.monotonic()
-            resp = await audiohub.get_audio_list()
-            print(f"TTS {tag} get_list_after: {time.monotonic()-t0:.2f}s",
-                  flush=True)
-            audio_list = json.loads(
-                (resp.get("data") or {}).get("data", "{}")
-            ).get("audio_list", [])
-            for item in audio_list:
-                if item.get("CUSTOM_NAME") == file_name:
-                    entry["uuid"] = item["UNIQUE_ID"]
-                    break
+            if entry["uuid"] is None:
+                t0 = time.monotonic()
+                resp = await audiohub.get_audio_list()
+                print(f"TTS {tag} get_list_before: {time.monotonic()-t0:.2f}s",
+                      flush=True)
+                audio_list = json.loads(
+                    (resp.get("data") or {}).get("data", "{}")
+                ).get("audio_list", [])
+                for item in audio_list:
+                    if item.get("CUSTOM_NAME") == file_name:
+                        t0 = time.monotonic()
+                        await audiohub.delete_record(item["UNIQUE_ID"])
+                        print(f"TTS {tag} delete_old: "
+                              f"{time.monotonic()-t0:.2f}s", flush=True)
+                        break
+                t0 = time.monotonic()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    await audiohub.upload_audio_file(entry["path"])
+                print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
+                      f"({os.path.getsize(entry['path'])} bytes)", flush=True)
+                t0 = time.monotonic()
+                resp = await audiohub.get_audio_list()
+                print(f"TTS {tag} get_list_after: {time.monotonic()-t0:.2f}s",
+                      flush=True)
+                audio_list = json.loads(
+                    (resp.get("data") or {}).get("data", "{}")
+                ).get("audio_list", [])
+                for item in audio_list:
+                    if item.get("CUSTOM_NAME") == file_name:
+                        entry["uuid"] = item["UNIQUE_ID"]
+                        break
 
         if entry["uuid"]:
             # Mute the USB mic for the actual audio length + a safety buffer.
@@ -182,47 +210,30 @@ async def prepare(text: str, audiohub, cache: dict):
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
         file_name = f"pella_{text_hash}"
-        entry = cache.setdefault(
-            text_hash, {"path": None, "uuid": None, "duration": 0.0}
-        )
+        entry = _get_or_create_entry(cache, text_hash)
         preview = (text[:50] + "…") if len(text) > 50 else text
         tag = f"[{text_hash} prep]"
 
-        if entry["path"] is None:
-            t0 = time.monotonic()
-            entry["path"], entry["duration"] = (
-                await asyncio.get_event_loop().run_in_executor(
-                    None, _generate_wav, text, text_hash
+        # Serialise against speak() (or another prepare()) racing on the
+        # same text_hash — see comment in speak().
+        async with entry["lock"]:
+            if entry["path"] is None:
+                t0 = time.monotonic()
+                entry["path"], entry["duration"] = (
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _generate_wav, text, text_hash
+                    )
                 )
-            )
-            print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
-                  f"({entry['duration']:.2f}s audio) "
-                  f"{repr(preview)}", flush=True)
-        elif not entry.get("duration"):
-            entry["duration"] = _wav_duration(entry["path"])
+                print(f"TTS {tag} gen_wav: {time.monotonic()-t0:.2f}s "
+                      f"({entry['duration']:.2f}s audio) "
+                      f"{repr(preview)}", flush=True)
+            elif not entry.get("duration"):
+                entry["duration"] = _wav_duration(entry["path"])
 
-        if entry["uuid"] is None:
-            t0 = time.monotonic()
-            resp = await audiohub.get_audio_list()
-            print(f"TTS {tag} get_list_before: "
-                  f"{time.monotonic()-t0:.2f}s", flush=True)
-            audio_list = json.loads(
-                (resp.get("data") or {}).get("data", "{}")
-            ).get("audio_list", [])
-            for item in audio_list:
-                if item.get("CUSTOM_NAME") == file_name:
-                    entry["uuid"] = item["UNIQUE_ID"]
-                    break
             if entry["uuid"] is None:
                 t0 = time.monotonic()
-                with contextlib.redirect_stdout(io.StringIO()):
-                    await audiohub.upload_audio_file(entry["path"])
-                print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
-                      f"({os.path.getsize(entry['path'])} bytes)",
-                      flush=True)
-                t0 = time.monotonic()
                 resp = await audiohub.get_audio_list()
-                print(f"TTS {tag} get_list_after: "
+                print(f"TTS {tag} get_list_before: "
                       f"{time.monotonic()-t0:.2f}s", flush=True)
                 audio_list = json.loads(
                     (resp.get("data") or {}).get("data", "{}")
@@ -231,6 +242,24 @@ async def prepare(text: str, audiohub, cache: dict):
                     if item.get("CUSTOM_NAME") == file_name:
                         entry["uuid"] = item["UNIQUE_ID"]
                         break
+                if entry["uuid"] is None:
+                    t0 = time.monotonic()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        await audiohub.upload_audio_file(entry["path"])
+                    print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
+                          f"({os.path.getsize(entry['path'])} bytes)",
+                          flush=True)
+                    t0 = time.monotonic()
+                    resp = await audiohub.get_audio_list()
+                    print(f"TTS {tag} get_list_after: "
+                          f"{time.monotonic()-t0:.2f}s", flush=True)
+                    audio_list = json.loads(
+                        (resp.get("data") or {}).get("data", "{}")
+                    ).get("audio_list", [])
+                    for item in audio_list:
+                        if item.get("CUSTOM_NAME") == file_name:
+                            entry["uuid"] = item["UNIQUE_ID"]
+                            break
         return entry["uuid"] is not None
     except Exception as e:
         print(f"TTS prepare error for {repr(text[:60])}: {e}", flush=True)
