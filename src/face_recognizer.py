@@ -142,7 +142,7 @@ class FaceRecognizer:
 
     def enroll_new(self, name: str, bgr_frame: np.ndarray,
                    landmarks_5x2: np.ndarray = None, face_bbox: tuple = None,
-                   save_dir: str = "") -> bool:
+                   save_dir: str = "", trust_name: bool = False) -> bool:
         """Add a new person live and persist a face crop + .npy embedding.
 
         Alignment / embedding always use the full frame + landmarks (most accurate).
@@ -150,8 +150,14 @@ class FaceRecognizer:
         detection and alignment entirely.
 
         If a person with this name already exists, the new embedding must be
-        similar enough (cosine ≥ self.threshold) to the existing embeddings,
-        otherwise the save is rejected and False is returned.
+        similar enough (cosine ≥ self.enroll_threshold) to the existing
+        embeddings, otherwise the save is rejected and False is returned —
+        UNLESS `trust_name=True`, in which case the embedding is always
+        appended. Callers should set trust_name=True when the user just
+        verbally said this name (e.g. responding to "What is your name?")
+        — the verbal claim is the authoritative identity signal, and a
+        low similarity score there usually means the prior enrollment
+        was a poor capture, not that this is a different person.
         """
         aligned = (align_face(bgr_frame, landmarks_5x2)
                    if landmarks_5x2 is not None
@@ -159,12 +165,14 @@ class FaceRecognizer:
         emb = self._embed(aligned)
 
         if name in self.known:
-            best_sim = max(float(np.dot(emb, e)) for e in self.known[name])
-            if best_sim < self.enroll_threshold:
-                print(f"[FaceRecognizer] rejecting enrollment for '{name}': "
-                      f"similarity {best_sim:.2f} < {self.enroll_threshold:.2f} "
-                      f"(face doesn't match existing photos)", flush=True)
-                return False
+            if not trust_name:
+                best_sim = max(float(np.dot(emb, e)) for e in self.known[name])
+                if best_sim < self.enroll_threshold:
+                    print(f"[FaceRecognizer] rejecting enrollment for "
+                          f"'{name}': similarity {best_sim:.2f} < "
+                          f"{self.enroll_threshold:.2f} (face doesn't match "
+                          f"existing photos)", flush=True)
+                    return False
             self.known[name].append(emb)
         else:
             self.known[name] = [emb]

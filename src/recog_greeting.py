@@ -487,12 +487,21 @@ class RecogGreetingTask:
                 pass
 
         if self._recognizer:
+            # trust_name=True: the user verbally said this name a moment
+            # ago, so add the embedding to their set regardless of how
+            # similar it looks to the existing embeddings. The verbal
+            # claim is authoritative; rejecting the embedding on
+            # similarity grounds creates a circular failure when the
+            # original enrollment captured a poor-angle/poor-lighting
+            # frame ("you can't be William because William doesn't look
+            # like you, even though you just said you are").
             enrolled = self._recognizer.enroll_new(
                 dir_name,
                 self._enroll_state["frame"],
                 self._enroll_state["landmarks"],
                 self._enroll_state.get("bbox"),
                 save_dir,
+                trust_name=True,
             )
         else:
             # No recognizer loaded — fall back to saving the captured frame
