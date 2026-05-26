@@ -44,7 +44,8 @@ from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
     ENROLL_TIMEOUT, CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
-    ENROLL_BUFFER_SIZE,
+    ENROLL_BUFFER_SIZE, ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
+    ENROLL_BRIGHT_LO, ENROLL_BRIGHT_HI, ENROLL_BRIGHT_MIN_STD, ENROLL_TOP_K,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
@@ -493,38 +494,42 @@ class RecogGreetingTask:
             except Exception:
                 pass
 
-        best = self._pick_enroll_best()
-        if best is None:
+        top_k = self._pick_enroll_top_k()
+        if not top_k:
             # Should never happen — _enter_introducing seeds the buffer
             # with at least the recog_best_face. Defensive.
             print("Task[recog_greeting]: no enrollment candidates in "
                   "buffer — skipping", flush=True)
             enrolled = False
         elif self._recognizer:
-            # trust_name=True: the user verbally said this name a moment
-            # ago, so add the embedding to their set regardless of how
-            # similar it looks to the existing embeddings. The verbal
-            # claim is authoritative; rejecting the embedding on
-            # similarity grounds creates a circular failure when the
-            # original enrollment captured a poor-angle/poor-lighting
-            # frame ("you can't be William because William doesn't look
-            # like you, even though you just said you are").
-            enrolled = self._recognizer.enroll_new(
-                dir_name,
-                best["frame"],
-                best["landmarks"],
-                best["bbox"],
-                save_dir,
-                trust_name=True,
-            )
+            # Multi-template enrollment: save each of the top-K as a
+            # distinct embedding under the same identity. Recognition
+            # later matches by max cosine across the set, so different
+            # poses captured during this single window all contribute.
+            #
+            # trust_name=True on every call: the user verbally said this
+            # name a moment ago, so similarity-vs-existing-embeddings
+            # checks would create a circular failure.
+            enrolled = False
+            for best in top_k:
+                ok = self._recognizer.enroll_new(
+                    dir_name,
+                    best["frame"],
+                    best["landmarks"],
+                    best["bbox"],
+                    save_dir,
+                    trust_name=True,
+                )
+                enrolled = enrolled or ok
         else:
-            # No recognizer loaded — fall back to saving the captured frame
-            # only (no embedding). Use the same NNN.jpg numbering scheme so
-            # repeat enrollments for the same person don't overwrite each other.
+            # No recognizer loaded — fall back to saving the captured
+            # frames only (no embeddings). next_image_index gives each a
+            # distinct NNN.jpg so repeat enrollments don't overwrite.
             os.makedirs(save_dir, exist_ok=True)
-            idx = face_recognizer.next_image_index(save_dir)
-            cv2.imwrite(os.path.join(save_dir, f"{idx:03d}.jpg"),
-                        best["frame"])
+            for best in top_k:
+                idx = face_recognizer.next_image_index(save_dir)
+                cv2.imwrite(os.path.join(save_dir, f"{idx:03d}.jpg"),
+                            best["frame"])
             enrolled = True
         self._enroll_state["active"] = False
 
@@ -726,55 +731,138 @@ class RecogGreetingTask:
             "sharpness": s,
         })
 
-    def _pick_enroll_best(self) -> Optional[dict]:
-        """Score the buffered candidates and return the highest scorer.
+    def _pick_enroll_top_k(self, k: int = ENROLL_TOP_K) -> list:
+        """Score the buffered candidates and return up to `k` survivors.
 
-        Returns the candidate dict (frame / landmarks / bbox / sharpness)
-        or None if no candidates are available. Picks on
-            sharpness * (0.5 + 0.5 * frontality)
-        — sharpness alone misses pose: a 375-sharp face at a steep yaw is
-        worse for recognition than a 200-sharp frontal one. The 0.5 floor
-        keeps a candidate without landmark info from being zeroed out.
+        Each candidate passes through hard ISO/IEC 29794-5-style gates
+        (yaw, roll, inter-ocular distance, face-region brightness) before
+        being ranked by a weighted sum of normalised sharpness + pose +
+        IOD + brightness. Top-K survivors are returned in descending
+        score order — they will all be enrolled as distinct embeddings
+        under the same identity (multi-template enrollment, the dominant
+        production pattern per NIST FRVT).
+
+        If every candidate fails the gates, the top-K by relaxed score
+        are returned anyway so a user who said their name doesn't get
+        silently dropped; the journal log notes the fallback.
         """
         if not self._enroll_candidates:
-            return None
-        scored = [(self._enroll_candidate_score(c), c)
-                  for c in self._enroll_candidates]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best_score, best = scored[0]
-        # Also report the next-best for visibility of what was traded off.
-        if len(scored) > 1:
-            runner_score, runner = scored[1]
-            print(f"Task[recog_greeting]: picked enroll face from "
+            return []
+
+        scored = []
+        for c in self._enroll_candidates:
+            score, reason = self._enroll_candidate_score(c)
+            scored.append((score, reason, c))
+
+        survivors = [(s, r, c) for s, r, c in scored if s > float("-inf")]
+        rejected  = len(scored) - len(survivors)
+
+        if survivors:
+            survivors.sort(key=lambda x: x[0], reverse=True)
+            top = survivors[:k]
+            print(f"Task[recog_greeting]: enrolling top {len(top)} of "
                   f"{len(self._enroll_candidates)} candidates "
-                  f"(score={best_score:.1f} sharp={best['sharpness']:.1f}; "
-                  f"runner-up score={runner_score:.1f} "
-                  f"sharp={runner['sharpness']:.1f})", flush=True)
+                  f"({rejected} rejected by gates)", flush=True)
         else:
-            print(f"Task[recog_greeting]: picked enroll face "
-                  f"(only candidate; score={best_score:.1f} "
-                  f"sharp={best['sharpness']:.1f})", flush=True)
-        return best
+            # Pathological case — all gated out. Re-score with gates off
+            # so we still enroll *something*: the user gave their name,
+            # they expect to be remembered.
+            relaxed = [(self._enroll_candidate_relaxed_score(c), c)
+                       for c in self._enroll_candidates]
+            relaxed.sort(key=lambda x: x[0], reverse=True)
+            top = [(score, "fallback", c) for score, c in relaxed[:k]]
+            print(f"Task[recog_greeting]: WARN all "
+                  f"{len(self._enroll_candidates)} candidates failed "
+                  f"quality gates; falling back to relaxed score "
+                  f"(top {len(top)})", flush=True)
+
+        for i, (score, reason, c) in enumerate(top, 1):
+            print(f"  #{i}: score={score:.2f} sharp={c['sharpness']:.0f} "
+                  f"({reason})", flush=True)
+        return [c for _, _, c in top]
 
     @staticmethod
-    def _enroll_candidate_score(c: dict) -> float:
-        """Combined quality score: sharpness * (0.5 + 0.5 * frontality).
+    def _enroll_candidate_score(c: dict) -> tuple:
+        """Return (score, reason). score is -inf when a hard gate fails.
 
-        Frontality is derived from YuNet 5-point landmarks
-        (eyes + nose + mouth corners). Yaw is the dominant pose problem
-        for recognition, estimated as |nose_x - eye_midpoint_x| /
-        inter-eye distance. A perfectly frontal face has yaw_offset ~ 0;
-        we map yaw_offset / 0.3 -> bad. Without landmarks we fall back
-        to sharpness only (frontality = 1 in expectation, no penalty).
+        Hard gates (ISO/IEC 29794-5 inspired):
+          * yaw  > ENROLL_MAX_YAW       — face turned too far sideways
+          * roll > ENROLL_MAX_ROLL      — head tilted too much
+          * IOD  < ENROLL_MIN_IOD       — face too small / far away
+          * brightness mean outside [LO, HI] or std too low (washed-out)
+
+        Survivors get a weighted sum in [0, 1] of normalised components:
+            0.4 * sharpness + 0.3 * pose + 0.2 * IOD + 0.1 * brightness
+        Weights follow the FIQA literature's empirical findings
+        (sharpness + pose dominate, IOD is a strong tiebreaker, brightness
+        small but real).
         """
-        s = c["sharpness"]
+        s   = c["sharpness"]
+        lm  = c["landmarks"]
+        if lm is None or len(lm) < 3:
+            return float("-inf"), "no_landmarks"
+
+        left_eye, right_eye, nose = lm[0], lm[1], lm[2]
+        eye_mid_x = (left_eye[0] + right_eye[0]) * 0.5
+        iod       = float(((right_eye[0] - left_eye[0]) ** 2
+                           + (right_eye[1] - left_eye[1]) ** 2) ** 0.5)
+        if iod < 1e-3:
+            return float("-inf"), "iod_zero"
+
+        yaw_offset = abs(nose[0] - eye_mid_x) / iod
+        roll_norm  = abs(right_eye[1] - left_eye[1]) / iod
+
+        if iod < ENROLL_MIN_IOD:
+            return float("-inf"), f"iod={iod:.0f}<{ENROLL_MIN_IOD:.0f}"
+        if yaw_offset > ENROLL_MAX_YAW:
+            return float("-inf"), f"yaw={yaw_offset:.2f}>{ENROLL_MAX_YAW:.2f}"
+        if roll_norm > ENROLL_MAX_ROLL:
+            return float("-inf"), f"roll={roll_norm:.2f}>{ENROLL_MAX_ROLL:.2f}"
+
+        # Brightness check on the bbox region (cheap, no extra detection).
+        bx, by, bw, bh = c["bbox"]
+        frame = c["frame"]
+        face_region = frame[by:by + bh, bx:bx + bw]
+        if face_region.size == 0:
+            return float("-inf"), "bbox_empty"
+        gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+        bright_mean = float(gray.mean())
+        bright_std  = float(gray.std())
+        if bright_mean < ENROLL_BRIGHT_LO:
+            return float("-inf"), f"dark(mean={bright_mean:.0f})"
+        if bright_mean > ENROLL_BRIGHT_HI:
+            return float("-inf"), f"bright(mean={bright_mean:.0f})"
+        if bright_std < ENROLL_BRIGHT_MIN_STD:
+            return float("-inf"), f"flat(std={bright_std:.0f})"
+
+        # Normalise each component into [0, 1].
+        sharp_n  = min(1.0, s / 200.0)        # 200 ~ "good" sharpness
+        pose_n   = ((1.0 - yaw_offset / ENROLL_MAX_YAW)
+                    * (1.0 - roll_norm / ENROLL_MAX_ROLL))
+        iod_n    = min(1.0, iod / 120.0)      # 120 px ~ "good" face size at 720p
+        bright_n = max(0.0, 1.0 - abs(bright_mean - 128.0) / 64.0)
+
+        score = (0.4 * sharp_n
+                 + 0.3 * pose_n
+                 + 0.2 * iod_n
+                 + 0.1 * bright_n)
+        return score, "ok"
+
+    @staticmethod
+    def _enroll_candidate_relaxed_score(c: dict) -> float:
+        """Gates-off fallback used only when every candidate is gated out.
+
+        Same intuition as the old single-metric scorer: sharpness times a
+        soft frontality factor (yaw only), so the least-bad candidate is
+        picked. Kept tiny because it should almost never fire.
+        """
+        s  = c["sharpness"]
         lm = c["landmarks"]
         if lm is None or len(lm) < 3:
             return s * 0.5
-        left_eye, right_eye, nose = lm[0], lm[1], lm[2]
-        eye_mid_x  = (left_eye[0] + right_eye[0]) * 0.5
-        eye_width  = abs(right_eye[0] - left_eye[0]) + 1e-6
-        yaw_offset = abs(nose[0] - eye_mid_x) / eye_width
+        eye_mid_x  = (lm[0][0] + lm[1][0]) * 0.5
+        eye_width  = abs(lm[1][0] - lm[0][0]) + 1e-6
+        yaw_offset = abs(lm[2][0] - eye_mid_x) / eye_width
         yaw_q      = max(0.0, 1.0 - yaw_offset / 0.3)
         return s * (0.5 + 0.5 * yaw_q)
 

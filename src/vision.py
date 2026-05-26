@@ -61,6 +61,24 @@ ENROLL_BUFFER_SIZE   = 20     # max # of candidate face captures retained
                               # choose from but more memory (each entry is
                               # a full BGR frame copy, ~2.6 MB at 720p).
 
+# Per-candidate quality gates (ISO/IEC 29794-5 in spirit). A face that
+# fails any of these is rejected outright rather than scored low; only
+# survivors are ranked for multi-template enrollment.
+ENROLL_MAX_YAW       = 0.30   # nose offset / inter-eye distance
+ENROLL_MAX_ROLL      = 0.27   # |eye_y_diff| / inter-eye distance ≈ tan(15°)
+ENROLL_MIN_IOD       = 60.0   # inter-ocular distance in pixels — small faces
+                              # produce noisy ArcFace embeddings
+ENROLL_BRIGHT_LO     = 60.0   # mean grey of face region: below = under-exposed
+ENROLL_BRIGHT_HI     = 200.0  # mean grey of face region: above = blown out
+ENROLL_BRIGHT_MIN_STD = 25.0  # std-dev of face region: below = washed out
+
+# Multi-template enrollment: store the top-K embeddings per identity per
+# enrollment event. Recognition matches by max cosine across the set, so
+# different poses captured during a single window all contribute. The
+# academic + industry consensus (NIST FRVT, prod e-gate vendors) is that
+# multi-template is the single biggest accuracy win over single-image.
+ENROLL_TOP_K         = 3
+
 # ── Model paths ────────────────────────────────────────────────────────────────
 # _DIR is .../pella_app/src/. Model checkpoints + enrollment data live under
 # the repo's data/ tree (sibling of src/), so model & face paths resolve
