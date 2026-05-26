@@ -54,12 +54,15 @@ ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
                               # buffer + ~10s of CPU-Whisper = ~26s, so 30
                               # gives a small safety margin.
 SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
-ENROLL_BUFFER_SIZE   = 20     # max # of candidate face captures retained
-                              # during introducing; at enrollment time the
-                              # buffer is scored (sharpness + frontality)
-                              # and the best one is saved. Larger = more to
-                              # choose from but more memory (each entry is
-                              # a full BGR frame copy, ~2.6 MB at 720p).
+ENROLL_BUFFER_SIZE   = 40     # max # of candidate face captures retained
+                              # during introducing. With YuNet running every
+                              # FACE_DETECT_EVERY ticks at ~6 detections/sec
+                              # over a 10-s window, 40 spans ~6-7 s of the
+                              # window (the latter portion, after the
+                              # sit/look-up motion settles). Each entry is
+                              # a full BGR frame copy (~2.6 MB at 720p) so
+                              # peak transient memory ~ 100 MB during
+                              # introducing, released right after.
 
 # Per-candidate quality gates (ISO/IEC 29794-5 in spirit). A face that
 # fails any of these is rejected outright rather than scored low; only
@@ -72,12 +75,18 @@ ENROLL_BRIGHT_LO     = 60.0   # mean grey of face region: below = under-exposed
 ENROLL_BRIGHT_HI     = 200.0  # mean grey of face region: above = blown out
 ENROLL_BRIGHT_MIN_STD = 25.0  # std-dev of face region: below = washed out
 
-# Multi-template enrollment: store the top-K embeddings per identity per
+# Multi-template enrollment: store up to K embeddings per identity per
 # enrollment event. Recognition matches by max cosine across the set, so
-# different poses captured during a single window all contribute. The
-# academic + industry consensus (NIST FRVT, prod e-gate vendors) is that
-# multi-template is the single biggest accuracy win over single-image.
-ENROLL_TOP_K         = 3
+# different poses captured during a single window all contribute.
+#
+# K is an UPPER CAP, not a target. In practice the hard quality gates
+# (yaw/roll/iod/brightness) reject many candidates, and the rest are
+# saved up to this cap. Generous on purpose: both the robot and the
+# subject can be in motion during the window (sit_look_up alone takes
+# ~1.5 s), so a wider sample captures more pose/lighting diversity. We
+# can prune later if any one identity's template set grows unwieldy;
+# recognition over 10 templates per person costs ~50 µs, irrelevant.
+ENROLL_TOP_K         = 10
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 # _DIR is .../pella_app/src/. Model checkpoints + enrollment data live under
