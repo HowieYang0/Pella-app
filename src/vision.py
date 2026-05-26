@@ -54,6 +54,12 @@ ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
                               # buffer + ~10s of CPU-Whisper = ~26s, so 30
                               # gives a small safety margin.
 SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
+ENROLL_BUFFER_SIZE   = 20     # max # of candidate face captures retained
+                              # during introducing; at enrollment time the
+                              # buffer is scored (sharpness + frontality)
+                              # and the best one is saved. Larger = more to
+                              # choose from but more memory (each entry is
+                              # a full BGR frame copy, ~2.6 MB at 720p).
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 # _DIR is .../pella_app/src/. Model checkpoints + enrollment data live under

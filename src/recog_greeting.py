@@ -44,6 +44,7 @@ from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
     ENROLL_TIMEOUT, CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
+    ENROLL_BUFFER_SIZE,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
@@ -297,10 +298,14 @@ class RecogGreetingTask:
         self._last_greeted: dict = {}
 
         # Enrollment state (driven by submit_transcript / timeout).
-        self._enroll_state = {
-            "active": False, "frame": None, "landmarks": None,
-            "bbox":   None,  "asked_at": 0.0, "best_sharpness": 0.0,
-        }
+        self._enroll_state = {"active": False, "asked_at": 0.0}
+
+        # Ring buffer of candidate face captures collected during the
+        # introducing window. Scored and picked at enrollment time so
+        # we deliberate over many frames instead of greedily committing
+        # to the first sharp one in real time (which often turned out
+        # to be a poor-pose capture).
+        self._enroll_candidates: deque = deque(maxlen=ENROLL_BUFFER_SIZE)
 
         # Correction state: after Pella greets/introduces someone, the user
         # has CORRECTION_WINDOW seconds to say "my name is X" to rename them.
@@ -361,10 +366,12 @@ class RecogGreetingTask:
                     and now >= self._recog_stabilize_until:
                 self._update_best_face(img)
 
-        # Enrollment best-frame upgrade (independent of phase).
+        # Append face captures to the candidate buffer during enrollment.
+        # The best one is picked from the buffer when submit_transcript
+        # fires successful enrollment.
         if self._enroll_state["active"] and img is not None \
                 and self._last_complete_faces:
-            self._update_enroll_best(img)
+            self._capture_enroll_candidate(img)
 
         # Cancel enrollment if the person didn't respond in time.
         if self._enroll_state["active"] \
@@ -486,7 +493,14 @@ class RecogGreetingTask:
             except Exception:
                 pass
 
-        if self._recognizer:
+        best = self._pick_enroll_best()
+        if best is None:
+            # Should never happen — _enter_introducing seeds the buffer
+            # with at least the recog_best_face. Defensive.
+            print("Task[recog_greeting]: no enrollment candidates in "
+                  "buffer — skipping", flush=True)
+            enrolled = False
+        elif self._recognizer:
             # trust_name=True: the user verbally said this name a moment
             # ago, so add the embedding to their set regardless of how
             # similar it looks to the existing embeddings. The verbal
@@ -497,9 +511,9 @@ class RecogGreetingTask:
             # like you, even though you just said you are").
             enrolled = self._recognizer.enroll_new(
                 dir_name,
-                self._enroll_state["frame"],
-                self._enroll_state["landmarks"],
-                self._enroll_state.get("bbox"),
+                best["frame"],
+                best["landmarks"],
+                best["bbox"],
                 save_dir,
                 trust_name=True,
             )
@@ -510,7 +524,7 @@ class RecogGreetingTask:
             os.makedirs(save_dir, exist_ok=True)
             idx = face_recognizer.next_image_index(save_dir)
             cv2.imwrite(os.path.join(save_dir, f"{idx:03d}.jpg"),
-                        self._enroll_state["frame"])
+                        best["frame"])
             enrolled = True
         self._enroll_state["active"] = False
 
@@ -692,23 +706,77 @@ class RecogGreetingTask:
                 "sharpness": s,
             }
 
-    def _update_enroll_best(self, img: np.ndarray):
-        """During enrollment, upgrade enroll_state with the sharpest face."""
+    def _capture_enroll_candidate(self, img: np.ndarray):
+        """Append the current largest detected face to the candidate buffer.
+
+        Replaces the older greedy "keep only the sharpest" approach: by
+        retaining many candidates we can score them on more than just
+        sharpness at enrollment time (see _pick_enroll_best).
+        """
         biggest = max(self._last_complete_faces, key=lambda f: f[2] * f[3])
         bx, by, bw, bh = biggest[:4]
         region = img[by:by + bh, bx:bx + bw]
         if region.size == 0:
             return
         s = sharpness(region)
-        if s > self._enroll_state["best_sharpness"]:
-            self._enroll_state.update({
-                "frame":          img.copy(),
-                "landmarks":      biggest[4] if len(biggest) > 4 else None,
-                "bbox":           (bx, by, bw, bh),
-                "best_sharpness": s,
-            })
-            print(f"Task[recog_greeting]: sharper enroll face captured "
-                  f"(sharpness={s:.1f})", flush=True)
+        self._enroll_candidates.append({
+            "frame":     img.copy(),
+            "landmarks": biggest[4] if len(biggest) > 4 else None,
+            "bbox":      (bx, by, bw, bh),
+            "sharpness": s,
+        })
+
+    def _pick_enroll_best(self) -> Optional[dict]:
+        """Score the buffered candidates and return the highest scorer.
+
+        Returns the candidate dict (frame / landmarks / bbox / sharpness)
+        or None if no candidates are available. Picks on
+            sharpness * (0.5 + 0.5 * frontality)
+        — sharpness alone misses pose: a 375-sharp face at a steep yaw is
+        worse for recognition than a 200-sharp frontal one. The 0.5 floor
+        keeps a candidate without landmark info from being zeroed out.
+        """
+        if not self._enroll_candidates:
+            return None
+        scored = [(self._enroll_candidate_score(c), c)
+                  for c in self._enroll_candidates]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best = scored[0]
+        # Also report the next-best for visibility of what was traded off.
+        if len(scored) > 1:
+            runner_score, runner = scored[1]
+            print(f"Task[recog_greeting]: picked enroll face from "
+                  f"{len(self._enroll_candidates)} candidates "
+                  f"(score={best_score:.1f} sharp={best['sharpness']:.1f}; "
+                  f"runner-up score={runner_score:.1f} "
+                  f"sharp={runner['sharpness']:.1f})", flush=True)
+        else:
+            print(f"Task[recog_greeting]: picked enroll face "
+                  f"(only candidate; score={best_score:.1f} "
+                  f"sharp={best['sharpness']:.1f})", flush=True)
+        return best
+
+    @staticmethod
+    def _enroll_candidate_score(c: dict) -> float:
+        """Combined quality score: sharpness * (0.5 + 0.5 * frontality).
+
+        Frontality is derived from YuNet 5-point landmarks
+        (eyes + nose + mouth corners). Yaw is the dominant pose problem
+        for recognition, estimated as |nose_x - eye_midpoint_x| /
+        inter-eye distance. A perfectly frontal face has yaw_offset ~ 0;
+        we map yaw_offset / 0.3 -> bad. Without landmarks we fall back
+        to sharpness only (frontality = 1 in expectation, no penalty).
+        """
+        s = c["sharpness"]
+        lm = c["landmarks"]
+        if lm is None or len(lm) < 3:
+            return s * 0.5
+        left_eye, right_eye, nose = lm[0], lm[1], lm[2]
+        eye_mid_x  = (left_eye[0] + right_eye[0]) * 0.5
+        eye_width  = abs(right_eye[0] - left_eye[0]) + 1e-6
+        yaw_offset = abs(nose[0] - eye_mid_x) / eye_width
+        yaw_q      = max(0.0, 1.0 - yaw_offset / 0.3)
+        return s * (0.5 + 0.5 * yaw_q)
 
     # ── Phase advance helpers ────────────────────────────────────────────
 
@@ -948,14 +1016,17 @@ class RecogGreetingTask:
             print(f"Task[recog_greeting]: WARN say_queue full, "
                   f"name-ask not queued: {e}", flush=True)
         self._queue_recovery(now, after_tts=True)
-        self._enroll_state.update({
-            "active":         True,
-            "frame":          self._recog_best_face["img"],
-            "landmarks":      self._recog_best_face["landmarks"],
-            "bbox":           self._recog_best_face["bbox"],
-            "asked_at":       now,
-            "best_sharpness": self._recog_best_face["sharpness"],
+        # Seed the candidate buffer with the recognition-phase best face
+        # (the one that triggered introducing). More candidates accumulate
+        # via _capture_enroll_candidate across the introducing window.
+        self._enroll_candidates.clear()
+        self._enroll_candidates.append({
+            "frame":     self._recog_best_face["img"],
+            "landmarks": self._recog_best_face["landmarks"],
+            "bbox":      self._recog_best_face["bbox"],
+            "sharpness": self._recog_best_face["sharpness"],
         })
+        self._enroll_state.update({"active": True, "asked_at": now})
         self._last_introduced  = now
         self._last_motion_time = now
 
