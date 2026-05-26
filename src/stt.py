@@ -43,6 +43,13 @@ MAX_SPEECH_SEC        = 6.0    # hard cap. Reduced from 15 -> 6 for the new mic
                                # for "My name is William" + a beat of silence,
                                # and the resulting clip transcribes in Whisper
                                # in ~3-4 s instead of ~10.
+MAX_CLIP_AGE_SEC      = 15.0   # skip Whisper for any clip whose speech_start_t
+                               # is already this old by the time the serial
+                               # asr_executor reaches it. With max_workers=1
+                               # and 1-3 s Whisper latency per clip, queues
+                               # can grow several seconds during a noisy
+                               # listening window — anything stale will be
+                               # rejected by the consumer anyway.
 NOISE_FLOOR_EMA_ALPHA = 0.005  # slow EMA adaptation (~200 frames ≈ 4 s)
 NOISE_FLOOR_INIT      = 1500.0 # starting estimate for robot motor noise floor
 NOISE_FLOOR_FACTOR    = 1.4    # RMS must exceed floor × factor to count as speech
@@ -289,17 +296,35 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
         if len(samples) < min_samples:
             return
         clip_sec = len(samples) / USB_MIC_SAMPLE_RATE
+        # speech_end_t = end of audible speech ≈ start + buffered duration.
+        # The trailing silence trailer (USB_VAD_SILENCE_FRAMES) is part of
+        # `samples` so this is a slight over-estimate (by ~USB_SILENCE_FRAMES
+        # * 20ms), but that's fine for the downstream stitch-gap test which
+        # uses ~3 s windows.
+        speech_end_t = speech_start_t + clip_sec
         print(f"ASR: sending {clip_sec:.1f}s of audio "
               f"(speech started {time.monotonic() - speech_start_t:.1f}s ago)",
               flush=True)
 
         def _run():
+            # Drop stale clips: with max_workers=1 the executor serialises,
+            # and on a CPU-only Jetson a 6 s burst of speech can sit ~10 s
+            # in the queue before Whisper gets to it. By the time a stale
+            # clip would emerge no consumer (enrollment, chat, …) accepts
+            # it anyway — skip the transcribe to free the next slot sooner.
+            age = time.monotonic() - speech_start_t
+            if age > MAX_CLIP_AGE_SEC:
+                print(f"ASR: skipping stale {clip_sec:.1f}s clip "
+                      f"({age:.1f}s old, > {MAX_CLIP_AGE_SEC:.0f}s cutoff)",
+                      flush=True)
+                return
             text = transcribe(samples, src_sr=USB_MIC_SAMPLE_RATE,
                               nr_prop=USB_NR_PROP_DECREASE)
             if text:
                 print(f"Heard: {text}", flush=True)
                 try:
-                    transcript_queue.put_nowait((text, speech_start_t))
+                    transcript_queue.put_nowait(
+                        (text, speech_start_t, speech_end_t))
                 except Exception:
                     pass
             else:

@@ -31,12 +31,15 @@ CORRECTION_WINDOW    = 10.0   # seconds after Pella greets/introduces a person
                               # explicit intro phrase ("my name is X") is
                               # treated as a name correction and triggers a
                               # rename on disk + in the recognizer.
-ENROLL_LISTEN_WINDOW = 10.0   # seconds after intro during which the user is
+ENROLL_LISTEN_WINDOW = 20.0   # seconds after intro during which the user is
                               # expected to start speaking their name. A
                               # transcript whose VAD speech-start timestamp
                               # falls inside this window counts; later
-                              # speech does not.
-ENROLL_LOOKBACK_SEC  = 3.0    # accept speech started up to this many seconds
+                              # speech does not. Generous since a user who
+                              # answered during the TTS prompt has their
+                              # first try discarded by the mute window and
+                              # the listening window must cover their retry.
+ENROLL_LOOKBACK_SEC  = 5.0    # accept speech started up to this many seconds
                               # *before* intro. Users often anticipate the
                               # question and start answering as the prompt is
                               # still playing — without this allowance,
@@ -45,6 +48,16 @@ ENROLL_LOOKBACK_SEC  = 3.0    # accept speech started up to this many seconds
                               # are the real answer. _parse_name's strict
                               # mode still requires "my name is X" / "I am X"
                               # so random pre-question chatter won't pass.
+STITCH_GAP_SEC       = 3.0    # if a transcript arrives that doesn't parse
+                              # as a name (e.g. "My name is..." with VAD
+                              # flushing on prosody mid-utterance), hold it
+                              # this many seconds for a possible continuation.
+                              # The next transcript whose speech_start_t is
+                              # within this gap of the held transcript's
+                              # speech_end_t is concatenated and re-parsed.
+                              # Lets us forgive a VAD split without having
+                              # to extend USB_VAD_SILENCE_FRAMES (which
+                              # would inflate every per-clip latency).
 ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
                               # abandoned even if no transcript arrived.
                               # Larger than ENROLL_LISTEN_WINDOW to absorb

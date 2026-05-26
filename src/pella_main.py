@@ -126,9 +126,11 @@ def _make_gpt_feedback_handler(transcript_queue):
         if text:
             print(f"chat_go ASR: {text}", flush=True)
             try:
-                # Robot-side ASR has no capture timestamp — stamp it with
-                # "now" so downstream sees it as just-spoken speech.
-                transcript_queue.put_nowait((text, time.monotonic()))
+                # Robot-side ASR has no capture timestamps — stamp start and
+                # end with "now" so downstream treats it as just-spoken speech
+                # with zero duration (no stitching possible from this path).
+                now = time.monotonic()
+                transcript_queue.put_nowait((text, now, now))
             except Exception:
                 pass
     return _on_gpt_feedback
@@ -311,11 +313,11 @@ def main():
             # latest for the on-screen overlay.
             try:
                 while True:
-                    text, capture_t = transcript_queue.get_nowait()
+                    text, capture_t, end_t = transcript_queue.get_nowait()
                     transcript_text = text
                     transcript_time = now
                     print(f"Display: {text}", flush=True)
-                    tasks.submit_transcript(now, text, capture_t)
+                    tasks.submit_transcript(now, text, capture_t, end_t)
             except Empty:
                 pass
 

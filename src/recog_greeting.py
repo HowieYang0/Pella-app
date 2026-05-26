@@ -46,6 +46,7 @@ from vision import (
     ENROLL_TIMEOUT, CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
     ENROLL_BUFFER_SIZE, ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
     ENROLL_BRIGHT_LO, ENROLL_BRIGHT_HI, ENROLL_BRIGHT_MIN_STD, ENROLL_TOP_K,
+    STITCH_GAP_SEC,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
     sharpness, zoom_crop, recognition_worker,
 )
@@ -148,18 +149,33 @@ def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
     rename the person.
     """
     t = text.strip()
+    # Collapse ellipses ("..." or longer) to a single space before splitting
+    # on sentence punctuation. Whisper emits "..." for trailing-off speech
+    # ("My name is...") and the bare first-sentence split would otherwise
+    # cut the utterance at the first dot — losing the actual name that
+    # arrives after a stitch from the next clip.
+    t = re.sub(r"\.{2,}", " ", t)
     t = re.split(r"[.!?]", t, maxsplit=1)[0].strip()
     # Handles the most common name-intro phrasings. The apostrophe-s
     # contractions ("my name's", "name's") show up frequently in
     # Whisper transcripts even when the speaker said the full "my name is".
-    m = re.search(
+    intro_re = re.compile(
         r"(?:i am|i'm|i'?m\s+called|my\s+name\s+is|my\s+name'?s|name'?s|"
         r"call\s+me|this\s+is)\s+(.+)",
-        t, re.IGNORECASE,
+        re.IGNORECASE,
     )
-    if m:
+    # Loop because a stitched transcript can look like "my name is ... my
+    # name is Joy" — peeling off only the first intro phrase would leave
+    # "my name is Joy" and trip the non-name-word filter on "my". Strip
+    # all intro phrases iteratively until none remain.
+    matched_any = False
+    while True:
+        m = intro_re.search(t)
+        if not m:
+            break
+        matched_any = True
         t = m.group(1).strip()
-    elif require_intro_phrase:
+    if not matched_any and require_intro_phrase:
         return ""
     courtesy = (
         r",|\s+and\b|"
@@ -301,6 +317,18 @@ class RecogGreetingTask:
         # Enrollment state (driven by submit_transcript / timeout).
         self._enroll_state = {"active": False, "asked_at": 0.0}
 
+        # Sentence-stitching: when a transcript arrives that doesn't parse
+        # as a name (e.g. VAD split "My name is William" on mid-utterance
+        # prosody, giving us just "My name is..."), hold it for up to
+        # STITCH_GAP_SEC in case the continuation arrives in the next
+        # transcript. Cleared on _enter_introducing and after a successful
+        # stitch + parse.
+        self._enroll_pending = {
+            "text":         None,
+            "speech_end_t": 0.0,    # end of audible speech in the held clip
+            "expires_at":   0.0,    # monotonic wall-clock deadline
+        }
+
         # Ring buffer of candidate face captures collected during the
         # introducing window. Scored and picked at enrollment time so
         # we deliberate over many frames instead of greedily committing
@@ -374,6 +402,24 @@ class RecogGreetingTask:
                 and self._last_complete_faces:
             self._capture_enroll_candidate(img)
 
+        # Pending held transcript expired with no continuation: apologise
+        # and finalise enrollment if it's still active.
+        if self._enroll_pending["text"] is not None \
+                and now >= self._enroll_pending["expires_at"]:
+            held = self._enroll_pending["text"]
+            self._enroll_pending = {"text": None, "speech_end_t": 0.0,
+                                    "expires_at": 0.0}
+            if self._enroll_state["active"]:
+                self._enroll_state["active"] = False
+                try:
+                    self._say_queue.put_nowait(
+                        "Sorry, I didn't catch your name.")
+                except Exception:
+                    pass
+                print(f"Task[recog_greeting]: held transcript '{held}' "
+                      f"never completed — apologising and ending enrollment",
+                      flush=True)
+
         # Cancel enrollment if the person didn't respond in time.
         if self._enroll_state["active"] \
                 and now - self._enroll_state["asked_at"] >= ENROLL_TIMEOUT:
@@ -399,17 +445,23 @@ class RecogGreetingTask:
 
     # ── Transcript handoff (called from pella_main's transcript handler) ─
 
-    def submit_transcript(self, now, text, capture_t) -> bool:
+    def submit_transcript(self, now, text, capture_t, end_t) -> bool:
         """Drive enrollment if we're INTRODUCING and waiting for a name,
         or rename the just-addressed person if we're in a correction
         window after a greeting/enrollment.
 
         `capture_t` is the monotonic time the user actually started
-        speaking (stamped by stt.py at VAD-speech-start), not the time
-        the transcript arrived. We accept transcripts whose capture_t
-        falls inside [asked_at, asked_at + ENROLL_LISTEN_WINDOW], so a
-        slow Whisper transcription doesn't kill an enrollment whose
-        speech was timely.
+        speaking (stamped by stt.py at VAD-speech-start), and `end_t`
+        is the corresponding end of audible speech. We accept transcripts
+        whose capture_t falls inside [asked_at - ENROLL_LOOKBACK_SEC,
+        asked_at + ENROLL_LISTEN_WINDOW], so a slow Whisper transcription
+        doesn't kill an enrollment whose speech was timely.
+
+        If a transcript inside that window doesn't parse as a name, it's
+        held for STITCH_GAP_SEC and concatenated with the next transcript
+        whose speech_start_t is within STITCH_GAP_SEC of the held one's
+        end. This forgives a VAD split mid-utterance (e.g. "My name is..."
+        / "William.") without needing to extend the silence trailer.
 
         Returns True if the task consumed the transcript (pella_main can
         treat it as handled). False otherwise.
@@ -464,15 +516,43 @@ class RecogGreetingTask:
                   f"{repr(text)}", flush=True)
             return False
 
-        name_raw = _parse_name(text)
+        # Sentence stitching: if a previous transcript was held because
+        # it didn't parse on its own AND this transcript's speech-start
+        # is within STITCH_GAP_SEC of the held one's speech-end, treat
+        # them as one logical utterance and concatenate before parsing.
+        combined_text = text
+        pending_text  = self._enroll_pending["text"]
+        if pending_text is not None:
+            gap = capture_t - self._enroll_pending["speech_end_t"]
+            if gap < STITCH_GAP_SEC:
+                combined_text = f"{pending_text} {text}"
+                print(f"Task[recog_greeting]: stitched "
+                      f"({gap:.1f}s gap) '{pending_text}' + '{text}' "
+                      f"-> '{combined_text}'", flush=True)
+                self._enroll_pending = {"text": None, "speech_end_t": 0.0,
+                                        "expires_at": 0.0}
+            else:
+                # Gap too wide — the held transcript is stale. Drop it
+                # and treat the new transcript on its own.
+                print(f"Task[recog_greeting]: discarding stale held "
+                      f"transcript '{pending_text}' ({gap:.1f}s gap)",
+                      flush=True)
+                self._enroll_pending = {"text": None, "speech_end_t": 0.0,
+                                        "expires_at": 0.0}
+
+        name_raw = _parse_name(combined_text)
         if not name_raw:
-            self._enroll_state["active"] = False
-            try:
-                self._say_queue.put_nowait("Sorry, I didn't catch your name.")
-            except Exception:
-                pass
-            print(f"Task[recog_greeting]: enrollment skipped, "
-                  f"'{text}' didn't parse as a name", flush=True)
+            # Don't apologise yet — hold this transcript for STITCH_GAP_SEC
+            # in case the rest of the utterance arrives in the next
+            # transcript (VAD often splits "My name is William" on prosody).
+            self._enroll_pending = {
+                "text":         combined_text,
+                "speech_end_t": end_t,
+                "expires_at":   now + STITCH_GAP_SEC,
+            }
+            print(f"Task[recog_greeting]: '{combined_text}' didn't parse "
+                  f"yet — holding {STITCH_GAP_SEC:.1f}s for a possible "
+                  f"continuation", flush=True)
             return True
 
         dir_name     = name_raw.lower().replace(" ", "_")
@@ -750,19 +830,31 @@ class RecogGreetingTask:
             return []
 
         scored = []
+        reject_reasons: Counter = Counter()
         for c in self._enroll_candidates:
             score, reason = self._enroll_candidate_score(c)
             scored.append((score, reason, c))
+            if score == float("-inf"):
+                # Extract the gate name from the reason string. Reasons
+                # look like "yaw=0.45>0.30", "iod=40<60", "dark(mean=20)",
+                # "no_landmarks", etc. Pull off the leading identifier
+                # before "=" or "(" for the histogram.
+                gate = reason.split("=")[0].split("(")[0]
+                reject_reasons[gate] += 1
 
         survivors = [(s, r, c) for s, r, c in scored if s > float("-inf")]
         rejected  = len(scored) - len(survivors)
+        gate_summary = (", ".join(f"{g}={n}"
+                                  for g, n in reject_reasons.most_common())
+                        or "none")
 
         if survivors:
             survivors.sort(key=lambda x: x[0], reverse=True)
             top = survivors[:k]
             print(f"Task[recog_greeting]: enrolling top {len(top)} of "
                   f"{len(self._enroll_candidates)} candidates "
-                  f"({rejected} rejected by gates)", flush=True)
+                  f"({rejected} rejected by gates: {gate_summary})",
+                  flush=True)
         else:
             # Pathological case — all gated out. Re-score with gates off
             # so we still enroll *something*: the user gave their name,
@@ -773,8 +865,8 @@ class RecogGreetingTask:
             top = [(score, "fallback", c) for score, c in relaxed[:k]]
             print(f"Task[recog_greeting]: WARN all "
                   f"{len(self._enroll_candidates)} candidates failed "
-                  f"quality gates; falling back to relaxed score "
-                  f"(top {len(top)})", flush=True)
+                  f"quality gates ({gate_summary}); falling back to "
+                  f"relaxed score (top {len(top)})", flush=True)
 
         for i, (score, reason, c) in enumerate(top, 1):
             print(f"  #{i}: score={score:.2f} sharp={c['sharpness']:.0f} "
@@ -1114,6 +1206,9 @@ class RecogGreetingTask:
             "bbox":      self._recog_best_face["bbox"],
             "sharpness": self._recog_best_face["sharpness"],
         })
+        # Reset any leftover stitch buffer from a prior attempt.
+        self._enroll_pending = {"text": None, "speech_end_t": 0.0,
+                                "expires_at": 0.0}
         self._enroll_state.update({"active": True, "asked_at": now})
         self._last_introduced  = now
         self._last_motion_time = now
