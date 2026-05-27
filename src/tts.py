@@ -14,6 +14,7 @@ owns the WebRTC connection (started by pella_main when audiohub is ready).
 """
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import io
@@ -27,21 +28,87 @@ from pydub import AudioSegment
 from stt import TTS_MUTE_SEC, tts_mute_until
 
 
+# ── Fast AudioHub upload ─────────────────────────────────────────────────────
+# The vendor `audiohub.upload_audio_file` uses 4 KB base64 chunks with a
+# 0.1 s sleep between every chunk; for a 132 KB WAV that's ~44 chunks of
+# pure waiting (>4 s) on top of the per-chunk request round-trip. The
+# protocol itself is chunk-size-flexible (`current_block_size` is
+# per-chunk metadata; webrtc_audiohub.py even defines an unused
+# CHUNK_SIZE = 61440 constant). Bigger chunks + shorter sleep should
+# cut upload time ~5×; combined with the 22 kHz native sample rate
+# (no upsample to 44.1 kHz) the typical novel-phrase upload drops
+# from ~10 s to ~1 s.
+FAST_UPLOAD_CHUNK_BYTES   = 16384  # base64 chunk size; well below the unused
+                                   # CHUNK_SIZE=61440 the vendor reserves
+FAST_UPLOAD_SLEEP_SEC     = 0.02   # gap between chunks; vendor uses 0.10
+AUDIOHUB_UPLOAD_API_ID    = 2001   # AUDIO_API["UPLOAD_AUDIO_FILE"]
+AUDIOHUB_REQUEST_TOPIC    = "rt/api/audiohub/request"
+
+
+async def _fast_upload_audio_file(audiohub, wav_path: str):
+    """Drop-in replacement for audiohub.upload_audio_file with bigger
+    chunks + shorter inter-chunk sleep. Talks to the same datachannel
+    pub-sub topic with the same JSON envelope as the vendor — only the
+    chunking constants differ.
+
+    Falls back automatically (returns None) on any datachannel exception
+    so the caller can retry via the vendor implementation if needed.
+    """
+    with open(wav_path, "rb") as f:
+        audio_data = f.read()
+    file_md5 = hashlib.md5(audio_data).hexdigest()
+    b64 = base64.b64encode(audio_data).decode("utf-8")
+    chunks = [b64[i:i + FAST_UPLOAD_CHUNK_BYTES]
+              for i in range(0, len(b64), FAST_UPLOAD_CHUNK_BYTES)]
+    file_name = os.path.splitext(os.path.basename(wav_path))[0]
+    total_chunks = len(chunks)
+
+    response = None
+    for i, chunk in enumerate(chunks, 1):
+        parameter = {
+            "file_name":          file_name,
+            "file_type":          "wav",
+            "file_size":          len(audio_data),
+            "current_block_index": i,
+            "total_block_number": total_chunks,
+            "block_content":      chunk,
+            "current_block_size": len(chunk),
+            "file_md5":           file_md5,
+            "create_time":        int(time.time() * 1000),
+        }
+        response = await audiohub.data_channel.pub_sub.publish_request_new(
+            AUDIOHUB_REQUEST_TOPIC,
+            {
+                "api_id":    AUDIOHUB_UPLOAD_API_ID,
+                "parameter": json.dumps(parameter, ensure_ascii=True),
+            },
+        )
+        if FAST_UPLOAD_SLEEP_SEC > 0 and i < total_chunks:
+            await asyncio.sleep(FAST_UPLOAD_SLEEP_SEC)
+    return response
+
+
 # ── WAV generation ───────────────────────────────────────────────────────────
 
 def _generate_wav(text: str, text_hash: str):
-    """Convert text to a 44.1 kHz WAV via gTTS. Returns (path, duration_sec).
+    """Convert text to a WAV via gTTS. Returns (path, duration_sec).
 
     Runs on a worker thread (called via run_in_executor) because gTTS makes
     blocking HTTP requests to Google's TTS service. The duration is needed
     by the caller to size the TTS-mute window so the USB mic doesn't
     capture (and re-transcribe) Pella's own speech.
+
+    The WAV is exported at gTTS's native sample rate (22.05 kHz mono),
+    not upsampled — 22.05 kHz is plenty for speech and produces a WAV
+    half the size of a 44.1 kHz version, which roughly halves the
+    audiohub upload time over the Go2's WebRTC datachannel. The WAV
+    header carries the sample rate so the player picks it up.
     """
     from gtts import gTTS
     mp3_path = f"/tmp/pella_{text_hash}.mp3"
     out_path = f"/tmp/pella_{text_hash}.wav"
     gTTS(text=text, lang="en").save(mp3_path)
-    sound = AudioSegment.from_mp3(mp3_path).set_frame_rate(44100)
+    sound = AudioSegment.from_mp3(mp3_path)
     sound.export(out_path, format="wav")
     os.unlink(mp3_path)
     return out_path, len(sound) / 1000.0
@@ -180,9 +247,21 @@ async def speak(text: str, audiohub, cache: dict):
                               f"{time.monotonic()-t0:.2f}s", flush=True)
                         break
                 t0 = time.monotonic()
-                with contextlib.redirect_stdout(io.StringIO()):
-                    await audiohub.upload_audio_file(entry["path"])
-                print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        await _fast_upload_audio_file(audiohub, entry["path"])
+                    upload_method = "fast"
+                except Exception as fast_err:
+                    # Fall back to the vendor's slower-but-known-good
+                    # uploader if our larger-chunk path errors out (e.g.
+                    # Go2 firmware rejects 16 KB chunks on some version).
+                    print(f"TTS {tag} fast_upload failed ({fast_err}); "
+                          f"falling back to vendor uploader", flush=True)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        await audiohub.upload_audio_file(entry["path"])
+                    upload_method = "vendor"
+                print(f"TTS {tag} upload[{upload_method}]: "
+                      f"{time.monotonic()-t0:.2f}s "
                       f"({os.path.getsize(entry['path'])} bytes)", flush=True)
                 t0 = time.monotonic()
                 resp = await audiohub.get_audio_list()
@@ -276,9 +355,20 @@ async def prepare(text: str, audiohub, cache: dict):
                         break
                 if entry["uuid"] is None:
                     t0 = time.monotonic()
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        await audiohub.upload_audio_file(entry["path"])
-                    print(f"TTS {tag} upload: {time.monotonic()-t0:.2f}s "
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            await _fast_upload_audio_file(audiohub,
+                                                          entry["path"])
+                        upload_method = "fast"
+                    except Exception as fast_err:
+                        print(f"TTS {tag} fast_upload failed ({fast_err}); "
+                              f"falling back to vendor uploader",
+                              flush=True)
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            await audiohub.upload_audio_file(entry["path"])
+                        upload_method = "vendor"
+                    print(f"TTS {tag} upload[{upload_method}]: "
+                          f"{time.monotonic()-t0:.2f}s "
                           f"({os.path.getsize(entry['path'])} bytes)",
                           flush=True)
                     t0 = time.monotonic()
