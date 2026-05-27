@@ -38,70 +38,106 @@ from stt import TTS_MUTE_SEC, tts_mute_until
 # cut upload time ~5×; combined with the 22 kHz native sample rate
 # (no upsample to 44.1 kHz) the typical novel-phrase upload drops
 # from ~10 s to ~1 s.
-FAST_UPLOAD_CHUNK_BYTES   = 4096   # match the vendor's chunk size — the Go2
-                                   # firmware seems to silently stall on
-                                   # larger chunks (a 16 KB attempt left
-                                   # the per-chunk publish_request_new
-                                   # awaiting a response that never came).
-                                   # The win comes from the shorter sleep.
-FAST_UPLOAD_SLEEP_SEC     = 0.02   # gap between chunks; vendor uses 0.10
-FAST_UPLOAD_CHUNK_TIMEOUT = 2.0    # if a single chunk's publish_request_new
-                                   # doesn't return within this window the
-                                   # call is aborted via asyncio.TimeoutError
-                                   # which escalates to the outer try/except
-                                   # so we cleanly fall back to the vendor
-                                   # uploader instead of hanging forever.
-AUDIOHUB_UPLOAD_API_ID    = 2001   # AUDIO_API["UPLOAD_AUDIO_FILE"]
-AUDIOHUB_REQUEST_TOPIC    = "rt/api/audiohub/request"
+FAST_UPLOAD_CHUNK_BYTES     = 4096  # vendor-compatible chunk size; bigger
+                                    # chunks made the Go2 firmware silently
+                                    # stall (see commit history).
+FAST_UPLOAD_FINAL_TIMEOUT   = 8.0   # max wall-clock for the LAST chunk's
+                                    # response — generous because by the
+                                    # time the dock awaits, the Go2 may
+                                    # still be reassembling the earlier
+                                    # fire-and-forget chunks.
+AUDIOHUB_UPLOAD_API_ID      = 2001  # AUDIO_API["UPLOAD_AUDIO_FILE"]
+AUDIOHUB_REQUEST_TOPIC      = "rt/api/audiohub/request"
+# Imported from the vendor at call time to avoid a hard import dep here.
+# DATA_CHANNEL_TYPE["REQUEST"] is the string "req".
+_DC_TYPE_REQUEST = "req"
+
+
+def _build_chunk_payload(parameter: dict) -> dict:
+    """Build the same request envelope `publish_request_new` constructs
+    internally — but we'll send it through `publish_without_callback` to
+    skip per-chunk response tracking on the fire-and-forget chunks.
+
+    The Go2 doesn't use the `id` field for upload ordering (it uses
+    `current_block_index` inside `parameter`), so a coarse millisecond
+    timestamp is fine here.
+    """
+    return {
+        "header": {
+            "identity": {
+                "id":     int(time.time() * 1000) % 2147483648,
+                "api_id": AUDIOHUB_UPLOAD_API_ID,
+            }
+        },
+        "parameter": json.dumps(parameter, ensure_ascii=True),
+    }
 
 
 async def _fast_upload_audio_file(audiohub, wav_path: str):
-    """Drop-in replacement for audiohub.upload_audio_file with bigger
-    chunks + shorter inter-chunk sleep. Talks to the same datachannel
-    pub-sub topic with the same JSON envelope as the vendor — only the
-    chunking constants differ.
+    """Sub-second AudioHub upload by fire-and-forget on all-but-last chunk.
 
-    Falls back automatically (returns None) on any datachannel exception
-    so the caller can retry via the vendor implementation if needed.
+    The vendor `upload_audio_file` awaits a per-chunk response and adds a
+    0.1 s sleep between every chunk; for a 132 KB WAV that's ~44 chunks
+    × ~150 ms = ~6.5 s of artificial pacing on top of the actual
+    bandwidth. Since the WebRTC SCTP datachannel guarantees reliable +
+    ordered delivery, we don't actually need per-chunk acks — we can
+    `channel.send` all N-1 chunks back-to-back (~tens of ms total) and
+    only await the response to the LAST chunk, which is also the
+    upload-completion signal.
+
+    On any exception (or hang past FAST_UPLOAD_FINAL_TIMEOUT on the
+    last chunk's response) the outer try/except in the caller falls
+    back to the vendor uploader.
     """
     with open(wav_path, "rb") as f:
         audio_data = f.read()
-    file_md5 = hashlib.md5(audio_data).hexdigest()
-    b64 = base64.b64encode(audio_data).decode("utf-8")
-    chunks = [b64[i:i + FAST_UPLOAD_CHUNK_BYTES]
-              for i in range(0, len(b64), FAST_UPLOAD_CHUNK_BYTES)]
+    file_md5  = hashlib.md5(audio_data).hexdigest()
+    b64       = base64.b64encode(audio_data).decode("utf-8")
+    chunks    = [b64[i:i + FAST_UPLOAD_CHUNK_BYTES]
+                 for i in range(0, len(b64), FAST_UPLOAD_CHUNK_BYTES)]
     file_name = os.path.splitext(os.path.basename(wav_path))[0]
     total_chunks = len(chunks)
 
-    response = None
-    for i, chunk in enumerate(chunks, 1):
-        parameter = {
-            "file_name":          file_name,
-            "file_type":          "wav",
-            "file_size":          len(audio_data),
+    def _param(i, chunk):
+        return {
+            "file_name":           file_name,
+            "file_type":           "wav",
+            "file_size":           len(audio_data),
             "current_block_index": i,
-            "total_block_number": total_chunks,
-            "block_content":      chunk,
-            "current_block_size": len(chunk),
-            "file_md5":           file_md5,
-            "create_time":        int(time.time() * 1000),
+            "total_block_number":  total_chunks,
+            "block_content":       chunk,
+            "current_block_size":  len(chunk),
+            "file_md5":            file_md5,
+            "create_time":         int(time.time() * 1000),
         }
-        # asyncio.wait_for so a chunk whose response never returns escalates
-        # to TimeoutError instead of hanging the whole speak()/prepare()
-        # forever. The outer try/except in the caller then falls back to
-        # the vendor uploader.
-        response = await asyncio.wait_for(
-            audiohub.data_channel.pub_sub.publish_request_new(
-                AUDIOHUB_REQUEST_TOPIC,
-                {
-                    "api_id":    AUDIOHUB_UPLOAD_API_ID,
-                    "parameter": json.dumps(parameter, ensure_ascii=True),
-                },
-            ),
-            timeout=FAST_UPLOAD_CHUNK_TIMEOUT,
+
+    pubsub = audiohub.data_channel.pub_sub
+
+    # Chunks 1..N-1: fire-and-forget via publish_without_callback.
+    # The datachannel preserves order; the Go2 reassembles by
+    # current_block_index. No per-chunk RTT cost.
+    for i, chunk in enumerate(chunks[:-1], 1):
+        pubsub.publish_without_callback(
+            AUDIOHUB_REQUEST_TOPIC,
+            _build_chunk_payload(_param(i, chunk)),
+            _DC_TYPE_REQUEST,
         )
-        if FAST_UPLOAD_SLEEP_SEC > 0 and i < total_chunks:
-            await asyncio.sleep(FAST_UPLOAD_SLEEP_SEC)
+
+    # Final chunk: await the response — this is the upload-completion
+    # signal. Generous timeout because the Go2 may still be processing
+    # the earlier fire-and-forget chunks when this lands.
+    last_i, last_chunk = total_chunks, chunks[-1]
+    response = await asyncio.wait_for(
+        pubsub.publish_request_new(
+            AUDIOHUB_REQUEST_TOPIC,
+            {
+                "api_id":    AUDIOHUB_UPLOAD_API_ID,
+                "parameter": json.dumps(_param(last_i, last_chunk),
+                                        ensure_ascii=True),
+            },
+        ),
+        timeout=FAST_UPLOAD_FINAL_TIMEOUT,
+    )
     return response
 
 
