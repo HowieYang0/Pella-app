@@ -38,9 +38,19 @@ from stt import TTS_MUTE_SEC, tts_mute_until
 # cut upload time ~5×; combined with the 22 kHz native sample rate
 # (no upsample to 44.1 kHz) the typical novel-phrase upload drops
 # from ~10 s to ~1 s.
-FAST_UPLOAD_CHUNK_BYTES   = 16384  # base64 chunk size; well below the unused
-                                   # CHUNK_SIZE=61440 the vendor reserves
+FAST_UPLOAD_CHUNK_BYTES   = 4096   # match the vendor's chunk size — the Go2
+                                   # firmware seems to silently stall on
+                                   # larger chunks (a 16 KB attempt left
+                                   # the per-chunk publish_request_new
+                                   # awaiting a response that never came).
+                                   # The win comes from the shorter sleep.
 FAST_UPLOAD_SLEEP_SEC     = 0.02   # gap between chunks; vendor uses 0.10
+FAST_UPLOAD_CHUNK_TIMEOUT = 2.0    # if a single chunk's publish_request_new
+                                   # doesn't return within this window the
+                                   # call is aborted via asyncio.TimeoutError
+                                   # which escalates to the outer try/except
+                                   # so we cleanly fall back to the vendor
+                                   # uploader instead of hanging forever.
 AUDIOHUB_UPLOAD_API_ID    = 2001   # AUDIO_API["UPLOAD_AUDIO_FILE"]
 AUDIOHUB_REQUEST_TOPIC    = "rt/api/audiohub/request"
 
@@ -76,12 +86,19 @@ async def _fast_upload_audio_file(audiohub, wav_path: str):
             "file_md5":           file_md5,
             "create_time":        int(time.time() * 1000),
         }
-        response = await audiohub.data_channel.pub_sub.publish_request_new(
-            AUDIOHUB_REQUEST_TOPIC,
-            {
-                "api_id":    AUDIOHUB_UPLOAD_API_ID,
-                "parameter": json.dumps(parameter, ensure_ascii=True),
-            },
+        # asyncio.wait_for so a chunk whose response never returns escalates
+        # to TimeoutError instead of hanging the whole speak()/prepare()
+        # forever. The outer try/except in the caller then falls back to
+        # the vendor uploader.
+        response = await asyncio.wait_for(
+            audiohub.data_channel.pub_sub.publish_request_new(
+                AUDIOHUB_REQUEST_TOPIC,
+                {
+                    "api_id":    AUDIOHUB_UPLOAD_API_ID,
+                    "parameter": json.dumps(parameter, ensure_ascii=True),
+                },
+            ),
+            timeout=FAST_UPLOAD_CHUNK_TIMEOUT,
         )
         if FAST_UPLOAD_SLEEP_SEC > 0 and i < total_chunks:
             await asyncio.sleep(FAST_UPLOAD_SLEEP_SEC)
