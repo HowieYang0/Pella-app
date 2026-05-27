@@ -151,11 +151,24 @@ def _run_robot_loop(robot_ip, frame_queue, say_queue, prep_queue,
         await front_camera.recv_video(track, frame_queue, stop_event)
 
     async def connect_loop():
+        # Process-lifetime TTS cache: text_hash -> {path, uuid, duration, lock}.
+        # Lives outside the reconnect loop so cached gTTS .wav paths survive
+        # WebRTC drops. On each reconnect we only invalidate the per-session
+        # `uuid` field (the new AudioHub doesn't know about the old session's
+        # UUIDs); the .wav files on /tmp stay valid, so warm-up after a
+        # reconnect re-uploads to the new AudioHub without re-fetching from
+        # gTTS — no internet round-trip needed. Critical on flaky WiFi where
+        # the LAN drop and a WAN blip often co-occur.
+        audio_cache = {}
+
         while not stop_event.is_set():
             conn = None
             audiohub = None
-            audio_cache = {}
             consumer_tasks = []
+            # Per-connection session: invalidate AudioHub UUIDs from any
+            # prior connection so the next warm-up re-uploads to *this*
+            # AudioHub. Preserves path/duration/lock.
+            tts.invalidate_audiohub_uuids(audio_cache)
 
             try:
                 print(f"Connecting to {robot_ip}...", flush=True)

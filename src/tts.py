@@ -69,6 +69,28 @@ def _wav_duration(path: str) -> float:
 MUTE_BUFFER_SEC = 1.0
 
 
+def invalidate_audiohub_uuids(cache: dict) -> int:
+    """Clear the `uuid` field of every cache entry. Returns the number
+    invalidated.
+
+    Called by pella_main on each new WebRTC connection: the previous
+    AudioHub session's UUIDs are not valid against the new AudioHub, so
+    a subsequent prepare/speak must re-upload the .wav. The .wav `path`
+    on /tmp, the `duration`, and the per-entry `lock` are preserved —
+    so re-upload is cheap and, crucially, requires no gTTS HTTP call
+    (no WAN dependency to recover from a reconnect).
+    """
+    n = 0
+    for entry in cache.values():
+        if entry.get("uuid") is not None:
+            entry["uuid"] = None
+            n += 1
+    if n:
+        print(f"TTS: invalidated {n} cached AudioHub uuid(s) for new session",
+              flush=True)
+    return n
+
+
 def _get_or_create_entry(cache: dict, text_hash: str) -> dict:
     """Return the cache entry for `text_hash`, creating it (with a fresh
     asyncio.Lock) if it doesn't exist yet.
@@ -123,7 +145,12 @@ async def speak(text: str, audiohub, cache: dict):
         # collide on /tmp/pella_<hash>.mp3 (the first os.unlinks it while
         # the second is still reading), and ffmpeg fails decoding.
         async with entry["lock"]:
-            if entry["path"] is None:
+            # Regenerate if the path was never set, OR if it was set in a
+            # previous session and the /tmp file has since been cleaned
+            # away by tmpwatch/systemd-tmpfiles. Treating a missing path
+            # as "must regenerate" keeps the cache honest across long
+            # uptimes.
+            if entry["path"] is None or not os.path.exists(entry["path"]):
                 t0 = time.monotonic()
                 entry["path"], entry["duration"] = (
                     await asyncio.get_event_loop().run_in_executor(
@@ -217,7 +244,12 @@ async def prepare(text: str, audiohub, cache: dict):
         # Serialise against speak() (or another prepare()) racing on the
         # same text_hash — see comment in speak().
         async with entry["lock"]:
-            if entry["path"] is None:
+            # Regenerate if the path was never set, OR if it was set in a
+            # previous session and the /tmp file has since been cleaned
+            # away by tmpwatch/systemd-tmpfiles. Treating a missing path
+            # as "must regenerate" keeps the cache honest across long
+            # uptimes.
+            if entry["path"] is None or not os.path.exists(entry["path"]):
                 t0 = time.monotonic()
                 entry["path"], entry["duration"] = (
                     await asyncio.get_event_loop().run_in_executor(
