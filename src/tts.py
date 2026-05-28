@@ -18,7 +18,6 @@ import base64
 import contextlib
 import hashlib
 import io
-import itertools
 import json
 import os
 import time
@@ -39,50 +38,32 @@ from stt import TTS_MUTE_SEC, tts_mute_until
 # cut upload time ~5×; combined with the 22 kHz native sample rate
 # (no upsample to 44.1 kHz) the typical novel-phrase upload drops
 # from ~10 s to ~1 s.
-FAST_UPLOAD_CHUNK_BYTES     = 4096  # vendor-compatible chunk size; bigger
-                                    # chunks made the Go2 firmware silently
-                                    # stall (see commit history).
-FAST_UPLOAD_CHUNK_TIMEOUT   = 8.0   # max wall-clock for a single chunk's
-                                    # response. On hang the asyncio.gather
-                                    # propagates the TimeoutError so the
-                                    # caller falls back to vendor uploader.
+FAST_UPLOAD_CHUNK_BYTES     = 4096  # vendor-compatible chunk size.
+FAST_UPLOAD_SLEEP_SEC       = 0.02  # gap between chunks; vendor uses 0.10.
+                                    # 5x shorter — still gives Go2 firmware
+                                    # time to process between chunks (which
+                                    # parallel/fire-and-forget did NOT) but
+                                    # cuts the per-chunk pacing 5x.
 AUDIOHUB_UPLOAD_API_ID      = 2001  # AUDIO_API["UPLOAD_AUDIO_FILE"]
 AUDIOHUB_REQUEST_TOPIC      = "rt/api/audiohub/request"
 
-# Monotonic id generator for upload chunk requests. The vendor's default
-# (timestamp_ms + random[0,1000]) collides with high probability when many
-# requests fire in the same millisecond — birthday-paradox in a 1000-element
-# space hits ~30% with 28 chunks. itertools.count guarantees uniqueness.
-_chunk_request_id_counter = itertools.count(int(time.time() * 1000))
-
-
-def _next_chunk_request_id() -> int:
-    """Monotonic, collision-free id for a single upload chunk's request."""
-    return next(_chunk_request_id_counter) % 2147483648
-
 
 async def _fast_upload_audio_file(audiohub, wav_path: str):
-    """Sub-second AudioHub upload by parallel-tracked send.
+    """Same chunk + ack protocol as vendor `upload_audio_file`, but with
+    a 0.02 s inter-chunk sleep instead of 0.10 s. ~5× faster than vendor
+    with the same reliability guarantees.
 
-    Vendor `upload_audio_file` sends each chunk and awaits its ack
-    sequentially, plus a 0.1 s sleep between every chunk — for a 132 KB
-    WAV that's 44 chunks × ~150 ms = ~6.5 s of artificial pacing.
+    Two previous attempts didn't survive contact with the Go2 firmware:
+      * Fire-and-forget (await only last chunk): the journal reported
+        upload[fast]: 0.51s but the actual file on the Go2 was truncated
+        — middle chunks silently dropped, "Hi, William" played as "Hi, W".
+      * Parallel `asyncio.gather` (per-chunk await with unique ids):
+        the Go2 firmware doesn't appear to respond per-chunk under
+        concurrent load — most futures never resolved and the gather
+        timed out at 8 s, falling back to the vendor uploader.
 
-    A previous attempt at pure fire-and-forget (channel.send back-to-back,
-    only await the LAST chunk's ack) shaved that to ~0.5 s but silently
-    dropped middle chunks under load — produced "Hi, W" of a "Hi, William"
-    upload that "succeeded" because the FINAL chunk's ack still arrived.
-
-    This version pipelines: each chunk's publish_request_new is launched
-    as a separate task via asyncio.gather. All chunks' channel.send fire
-    back-to-back (no per-chunk RTT wait inserted by us), but every chunk
-    is individually awaited so dropped chunks raise a TimeoutError and
-    propagate. The asyncio scheduler keeps the datachannel busy while
-    the Go2 firmware processes chunks in pipeline.
-
-    Each chunk uses a monotonic, collision-free request id (the vendor's
-    timestamp_ms + random[0,1000] generator collides ~30% of the time
-    when 28 chunks fire in the same millisecond).
+    The serial-await protocol is what the firmware actually expects.
+    The win we can keep is just the shorter inter-chunk sleep.
     """
     with open(wav_path, "rb") as f:
         audio_data = f.read()
@@ -93,8 +74,9 @@ async def _fast_upload_audio_file(audiohub, wav_path: str):
     file_name = os.path.splitext(os.path.basename(wav_path))[0]
     total_chunks = len(chunks)
 
-    def _param(i, chunk):
-        return {
+    response = None
+    for i, chunk in enumerate(chunks, 1):
+        parameter = {
             "file_name":           file_name,
             "file_type":           "wav",
             "file_size":           len(audio_data),
@@ -105,30 +87,16 @@ async def _fast_upload_audio_file(audiohub, wav_path: str):
             "file_md5":            file_md5,
             "create_time":         int(time.time() * 1000),
         }
-
-    pubsub = audiohub.data_channel.pub_sub
-
-    async def _send_chunk(i, chunk):
-        return await asyncio.wait_for(
-            pubsub.publish_request_new(
-                AUDIOHUB_REQUEST_TOPIC,
-                {
-                    "id":        _next_chunk_request_id(),
-                    "api_id":    AUDIOHUB_UPLOAD_API_ID,
-                    "parameter": json.dumps(_param(i, chunk),
-                                            ensure_ascii=True),
-                },
-            ),
-            timeout=FAST_UPLOAD_CHUNK_TIMEOUT,
+        response = await audiohub.data_channel.pub_sub.publish_request_new(
+            AUDIOHUB_REQUEST_TOPIC,
+            {
+                "api_id":    AUDIOHUB_UPLOAD_API_ID,
+                "parameter": json.dumps(parameter, ensure_ascii=True),
+            },
         )
-
-    # All chunks concurrent — channel.send fires synchronously for each
-    # task before any await, so the wire-time is back-to-back ~milliseconds,
-    # then all chunks' acks resolve as the Go2 pipelines them.
-    responses = await asyncio.gather(
-        *(_send_chunk(i, c) for i, c in enumerate(chunks, 1))
-    )
-    return responses[-1]
+        if FAST_UPLOAD_SLEEP_SEC > 0 and i < total_chunks:
+            await asyncio.sleep(FAST_UPLOAD_SLEEP_SEC)
+    return response
 
 
 # ── WAV generation ───────────────────────────────────────────────────────────
