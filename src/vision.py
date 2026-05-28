@@ -66,6 +66,14 @@ ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
                               # closed: ~10s of capture + ~6s of MAX_SPEECH
                               # buffer + ~10s of CPU-Whisper = ~26s, so 30
                               # gives a small safety margin.
+ENROLL_MAX_ATTEMPTS  = 3      # how many times Pella will ask for the name
+                              # before giving up. The first attempt is the
+                              # initial intro; each subsequent failure
+                              # (timeout, or unparseable transcript) plays
+                              # "Sorry, I didn't catch your name" and opens
+                              # a fresh ENROLL_LISTEN_WINDOW. After this
+                              # many total attempts have failed, enrollment
+                              # closes silently — no further apologies.
 SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
 ENROLL_BUFFER_SIZE   = 40     # max # of candidate face captures retained
                               # during introducing. With YuNet running every

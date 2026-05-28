@@ -43,7 +43,8 @@ import face_recognizer
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
-    ENROLL_TIMEOUT, CORRECTION_WINDOW, FACE_IDS_DIR, SHARPNESS_THRESHOLD,
+    ENROLL_TIMEOUT, ENROLL_MAX_ATTEMPTS, CORRECTION_WINDOW,
+    FACE_IDS_DIR, SHARPNESS_THRESHOLD,
     ENROLL_BUFFER_SIZE, ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
     ENROLL_BRIGHT_LO, ENROLL_BRIGHT_HI, ENROLL_BRIGHT_MIN_STD, ENROLL_TOP_K,
     STITCH_GAP_SEC,
@@ -315,7 +316,13 @@ class RecogGreetingTask:
         self._last_greeted: dict = {}
 
         # Enrollment state (driven by submit_transcript / timeout).
-        self._enroll_state = {"active": False, "asked_at": 0.0}
+        # `attempts` counts attempts made so far for the current
+        # introducing window: 1 = the initial intro is open, 2..N = a
+        # retry window is open after Pella apologised. When `attempts`
+        # exceeds ENROLL_MAX_ATTEMPTS, enrollment closes silently.
+        # Reset in _enter_introducing.
+        self._enroll_state = {"active": False, "asked_at": 0.0,
+                              "attempts": 0}
 
         # Sentence-stitching: when a transcript arrives that doesn't parse
         # as a name (e.g. VAD split "My name is William" on mid-utterance
@@ -403,29 +410,20 @@ class RecogGreetingTask:
             self._capture_enroll_candidate(img)
 
         # Pending held transcript expired with no continuation: apologise
-        # and finalise enrollment if it's still active.
+        # (first time) or close silently (second time, post-retry).
         if self._enroll_pending["text"] is not None \
                 and now >= self._enroll_pending["expires_at"]:
             held = self._enroll_pending["text"]
-            self._enroll_pending = {"text": None, "speech_end_t": 0.0,
-                                    "expires_at": 0.0}
-            if self._enroll_state["active"]:
-                self._enroll_state["active"] = False
-                try:
-                    self._say_queue.put_nowait(
-                        "Sorry, I didn't catch your name.")
-                except Exception:
-                    pass
-                print(f"Task[recog_greeting]: held transcript '{held}' "
-                      f"never completed — apologising and ending enrollment",
-                      flush=True)
+            self._apologise_and_arm_retry_or_close(
+                now, f"held transcript {held!r} never completed")
 
         # Cancel enrollment if the person didn't respond in time.
+        # Same retry semantics: first timeout apologises and gives one
+        # more ENROLL_LISTEN_WINDOW; second timeout closes silently.
         if self._enroll_state["active"] \
                 and now - self._enroll_state["asked_at"] >= ENROLL_TIMEOUT:
-            self._enroll_state["active"] = False
-            print("Task[recog_greeting]: enrollment timeout, no name received",
-                  flush=True)
+            self._apologise_and_arm_retry_or_close(
+                now, "enrollment timeout, no name received")
 
         # ── RESPOND: advance the state machine ───────────────────────────
         result = TickResult(latest_frame=img, latest_faces=self._last_faces)
@@ -442,6 +440,47 @@ class RecogGreetingTask:
         elif self._phase == COOLDOWN:
             result = self._tick_cooldown(now, result)
         return result
+
+    # ── Enrollment failure: apologise once, then close on second strike ──
+
+    def _apologise_and_arm_retry_or_close(self, now: float, reason: str):
+        """Common path when an enrollment attempt failed to receive or
+        parse a name.
+
+        Bumps `attempts`. While attempts remain in the budget
+        (≤ ENROLL_MAX_ATTEMPTS), say "Sorry, I didn't catch your name",
+        reset asked_at to now (giving the user a fresh
+        ENROLL_LISTEN_WINDOW), and stay active. The user can repeat
+        their name as "My name is X" or just "X".
+
+        When attempts exhausts the budget, close silently — no further
+        apologies, no chain of "Sorry"s.
+
+        Pending stitch buffer is always cleared so a fragment from the
+        previous attempt doesn't accidentally stitch with the retry
+        speech.
+        """
+        self._enroll_pending = {"text": None, "speech_end_t": 0.0,
+                                "expires_at": 0.0}
+        if not self._enroll_state["active"]:
+            return
+
+        attempts = self._enroll_state.get("attempts", 1)
+        if attempts < ENROLL_MAX_ATTEMPTS:
+            try:
+                self._say_queue.put_nowait(
+                    "Sorry, I didn't catch your name.")
+            except Exception:
+                pass
+            self._enroll_state["attempts"] = attempts + 1
+            self._enroll_state["asked_at"] = now
+            print(f"Task[recog_greeting]: {reason} — apologising "
+                  f"(attempt {attempts}/{ENROLL_MAX_ATTEMPTS} failed, "
+                  f"retry window open)", flush=True)
+        else:
+            self._enroll_state["active"] = False
+            print(f"Task[recog_greeting]: {reason} — giving up after "
+                  f"{attempts} attempts", flush=True)
 
     # ── Transcript handoff (called from pella_main's transcript handler) ─
 
@@ -1209,7 +1248,8 @@ class RecogGreetingTask:
         # Reset any leftover stitch buffer from a prior attempt.
         self._enroll_pending = {"text": None, "speech_end_t": 0.0,
                                 "expires_at": 0.0}
-        self._enroll_state.update({"active": True, "asked_at": now})
+        self._enroll_state.update({"active": True, "asked_at": now,
+                                   "attempts": 1})
         self._last_introduced  = now
         self._last_motion_time = now
 
