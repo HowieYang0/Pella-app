@@ -167,7 +167,15 @@ def transcribe(samples: np.ndarray,
                 audio_16k, language="en", beam_size=5,
                 vad_filter=True, condition_on_previous_text=False,
                 no_speech_threshold=0.5,
-                initial_prompt="Pella, Bella.",
+                # Language-model hint that biases Whisper toward the name-
+                # introduction patterns we actually listen for, away from
+                # frequent-English hallucinations ("It's Alison" / "Hey
+                # Mr. Ellison" instead of "My name is Alison"). Common
+                # short names anchor the model toward proper-noun
+                # interpretation of similar-sounding tokens.
+                initial_prompt=("Pella, Bella. My name is Alison. "
+                                "My name is William. Call me Sam. "
+                                "I am Joy."),
             )
             parts = [seg.text.strip() for seg in segments if seg.no_speech_prob < 0.5]
         else:
