@@ -31,14 +31,14 @@ CORRECTION_WINDOW    = 10.0   # seconds after Pella greets/introduces a person
                               # explicit intro phrase ("my name is X") is
                               # treated as a name correction and triggers a
                               # rename on disk + in the recognizer.
-ENROLL_LISTEN_WINDOW = 20.0   # seconds after intro during which the user is
+ENROLL_LISTEN_WINDOW = 15.0   # seconds after intro during which the user is
                               # expected to start speaking their name. A
                               # transcript whose VAD speech-start timestamp
                               # falls inside this window counts; later
-                              # speech does not. Generous since a user who
-                              # answered during the TTS prompt has their
-                              # first try discarded by the mute window and
-                              # the listening window must cover their retry.
+                              # speech does not. 15 s covers a thoughtful
+                              # pauser without dragging out the retry loop —
+                              # together with ENROLL_MAX_ATTEMPTS = 3 the
+                              # worst-case time before silent close is ~54 s.
 ENROLL_LOOKBACK_SEC  = 5.0    # accept speech started up to this many seconds
                               # *before* intro. Users often anticipate the
                               # question and start answering as the prompt is
@@ -58,14 +58,16 @@ STITCH_GAP_SEC       = 3.0    # if a transcript arrives that doesn't parse
                               # Lets us forgive a VAD split without having
                               # to extend USB_VAD_SILENCE_FRAMES (which
                               # would inflate every per-clip latency).
-ENROLL_TIMEOUT       = 30.0   # absolute deadline after which enrollment is
+ENROLL_TIMEOUT       = 18.0   # absolute deadline after which enrollment is
                               # abandoned even if no transcript arrived.
-                              # Larger than ENROLL_LISTEN_WINDOW to absorb
-                              # the worst-case Whisper transcription latency
-                              # for a user who spoke just before the window
-                              # closed: ~10s of capture + ~6s of MAX_SPEECH
-                              # buffer + ~10s of CPU-Whisper = ~26s, so 30
-                              # gives a small safety margin.
+                              # Slightly larger than ENROLL_LISTEN_WINDOW
+                              # to absorb VAD silence trailer (~1.2 s) +
+                              # CUDA Whisper inference (~0.5 s) + a safety
+                              # margin for a user who started speaking at
+                              # the very edge of the window. Reduced from
+                              # 30 s once Whisper moved to CUDA — CPU-int8
+                              # used to need ~10 s of headroom; the GPU
+                              # path needs ~3 s.
 ENROLL_MAX_ATTEMPTS  = 3      # how many times Pella will ask for the name
                               # before giving up. The first attempt is the
                               # initial intro; each subsequent failure
