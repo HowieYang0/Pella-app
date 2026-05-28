@@ -41,6 +41,15 @@ from stt import TTS_MUTE_SEC, tts_mute_until
 FAST_UPLOAD_CHUNK_BYTES     = 4096  # vendor-compatible chunk size; bigger
                                     # chunks made the Go2 firmware silently
                                     # stall (see commit history).
+FAST_UPLOAD_INTER_CHUNK_SEC = 0.01  # tiny pacing pause between fire-and-
+                                    # forget chunks. Pure 0-sleep firing
+                                    # overran the Go2's chunk buffer on
+                                    # 25+ chunk uploads ("Nice to meet
+                                    # you, Alison!" 28 chunks failed),
+                                    # but the vendor's 0.10 s was 10× more
+                                    # than needed. ~10 ms gives the
+                                    # firmware time to parse + write each
+                                    # chunk before the next arrives.
 FAST_UPLOAD_FINAL_TIMEOUT   = 8.0   # max wall-clock for the LAST chunk's
                                     # response — generous because by the
                                     # time the dock awaits, the Go2 may
@@ -113,15 +122,18 @@ async def _fast_upload_audio_file(audiohub, wav_path: str):
 
     pubsub = audiohub.data_channel.pub_sub
 
-    # Chunks 1..N-1: fire-and-forget via publish_without_callback.
-    # The datachannel preserves order; the Go2 reassembles by
-    # current_block_index. No per-chunk RTT cost.
+    # Chunks 1..N-1: fire-and-forget via publish_without_callback,
+    # with a tiny pacing pause so the Go2 firmware can drain its
+    # incoming buffer between chunks. The datachannel preserves order;
+    # the Go2 reassembles by current_block_index. No per-chunk RTT cost.
     for i, chunk in enumerate(chunks[:-1], 1):
         pubsub.publish_without_callback(
             AUDIOHUB_REQUEST_TOPIC,
             _build_chunk_payload(_param(i, chunk)),
             _DC_TYPE_REQUEST,
         )
+        if FAST_UPLOAD_INTER_CHUNK_SEC > 0:
+            await asyncio.sleep(FAST_UPLOAD_INTER_CHUNK_SEC)
 
     # Final chunk: await the response — this is the upload-completion
     # signal. Generous timeout because the Go2 may still be processing
@@ -308,7 +320,8 @@ async def speak(text: str, audiohub, cache: dict):
                     # Fall back to the vendor's slower-but-known-good
                     # uploader if our larger-chunk path errors out (e.g.
                     # Go2 firmware rejects 16 KB chunks on some version).
-                    print(f"TTS {tag} fast_upload failed ({fast_err}); "
+                    print(f"TTS {tag} fast_upload failed "
+                          f"({type(fast_err).__name__}: {fast_err}); "
                           f"falling back to vendor uploader", flush=True)
                     with contextlib.redirect_stdout(io.StringIO()):
                         await audiohub.upload_audio_file(entry["path"])
@@ -414,7 +427,8 @@ async def prepare(text: str, audiohub, cache: dict):
                                                           entry["path"])
                         upload_method = "fast"
                     except Exception as fast_err:
-                        print(f"TTS {tag} fast_upload failed ({fast_err}); "
+                        print(f"TTS {tag} fast_upload failed "
+                          f"({type(fast_err).__name__}: {fast_err}); "
                               f"falling back to vendor uploader",
                               flush=True)
                         with contextlib.redirect_stdout(io.StringIO()):
