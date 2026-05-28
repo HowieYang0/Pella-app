@@ -131,10 +131,15 @@ _NON_NAME_WORDS = {
     # Polite / imperative words seen in mis-captures
     "please", "thanks", "thank", "sorry",
     "stop", "hold", "wait", "excuse", "tell", "give", "take",
-    # Common state replies after "I'm X" — would otherwise be mis-parsed
-    # as a name correction by the intro-phrase branch.
+    # Common state replies after "I'm X" / "It's X" / "That's X" — would
+    # otherwise be mis-parsed as a name correction by the intro-phrase
+    # branch. Expanded to cover state words that follow the weaker
+    # "it's"/"that's" pointers added to intro_re.
     "fine", "good", "great", "well", "alright", "tired", "busy",
     "happy", "sad", "lost", "here", "back", "home", "ready",
+    "cool", "nice", "hot", "warm", "cold", "bad", "right", "wrong",
+    "true", "false", "late", "early", "easy", "hard", "fun", "old",
+    "new", "big", "small", "first", "last",
 }
 
 
@@ -161,9 +166,15 @@ def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
     # Handles the most common name-intro phrasings. The apostrophe-s
     # contractions ("my name's", "name's") show up frequently in
     # Whisper transcripts even when the speaker said the full "my name is".
+    #
+    # "it's X" / "that's X" are weak proper-noun pointers that Whisper
+    # often substitutes for "my name is X" — accepting them recovers the
+    # common journal failure "It's Jenny" -> rejected -> apologise.
+    # False-positive state replies ("It's fine", "That's right") are
+    # caught by the _NON_NAME_WORDS filter below.
     intro_re = re.compile(
         r"(?:i am|i'm|i'?m\s+called|my\s+name\s+is|my\s+name'?s|name'?s|"
-        r"call\s+me|this\s+is)\s+(.+)",
+        r"call\s+me|this\s+is|it'?s|it\s+is|that'?s|that\s+is)\s+(.+)",
         re.IGNORECASE,
     )
     # Loop because a stitched transcript can look like "my name is ... my
