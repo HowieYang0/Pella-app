@@ -68,6 +68,15 @@ ENROLL_TIMEOUT       = 18.0   # absolute deadline after which enrollment is
                               # 30 s once Whisper moved to CUDA — CPU-int8
                               # used to need ~10 s of headroom; the GPU
                               # path needs ~3 s.
+SEE_COMPLAINT_COOLDOWN = 60.0 # minimum seconds between successive
+                              # "Sorry, I cannot see you clearly" utterances.
+                              # The unknown-but-too-blurry path retriggers
+                              # whenever the same person remains in frame,
+                              # so without this Pella would chain the same
+                              # apology every ~5-10 s. The state machine
+                              # still goes through cooldown each time —
+                              # only the TTS is suppressed within the
+                              # window.
 ENROLL_MAX_ATTEMPTS  = 3      # how many times Pella will ask for the name
                               # before giving up. The first attempt is the
                               # initial intro; each subsequent failure

@@ -42,7 +42,8 @@ import actions
 import face_recognizer
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
-    INTRODUCE_COOLDOWN, ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
+    INTRODUCE_COOLDOWN, SEE_COMPLAINT_COOLDOWN,
+    ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
     ENROLL_TIMEOUT, ENROLL_MAX_ATTEMPTS, CORRECTION_WINDOW,
     FACE_IDS_DIR, SHARPNESS_THRESHOLD,
     ENROLL_BUFFER_SIZE, ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
@@ -305,6 +306,9 @@ class RecogGreetingTask:
         self._seek_start           = 0.0
         self._last_introduced      = 0.0
         self._last_complete_seen   = 0.0
+        # Suppresses chain-repeats of "Sorry, I cannot see you clearly"
+        # — see SEE_COMPLAINT_COOLDOWN in vision.py.
+        self._last_see_complaint_at = 0.0
 
         # Recognition state for the current RECOGNIZING phase.
         self._recog_obs              = deque(maxlen=RECOG_VOTES_REQUIRED)
@@ -1209,20 +1213,31 @@ class RecogGreetingTask:
             return result
         if (self._recog_best_face is None
                 or self._recog_best_face["sharpness"] < SHARPNESS_THRESHOLD):
-            # Let the person know why we're not engaging. Voice the apology
-            # first so the wait_for_tts before recovery covers playback.
-            try:
-                self._say_queue.put_nowait("Sorry, I cannot see you clearly.")
-            except Exception:
-                pass
-            self._queue_recovery(now, after_tts=True)
+            # Let the person know why we're not engaging — but only if we
+            # haven't said it recently. Without this cooldown, the same
+            # too-blurry face standing in front of Pella triggers the
+            # apology every ~5-10 s.
+            apologise = (now - self._last_see_complaint_at
+                         >= SEE_COMPLAINT_COOLDOWN)
+            if apologise:
+                try:
+                    self._say_queue.put_nowait(
+                        "Sorry, I cannot see you clearly.")
+                    self._last_see_complaint_at = now
+                except Exception:
+                    apologise = False
+            # `after_tts` only matters when we actually queued TTS —
+            # otherwise the recovery action can fire immediately.
+            self._queue_recovery(now, after_tts=apologise)
             self._phase         = COOLDOWN
             self._phase_entered = now
             sharp_str = (f"{self._recog_best_face['sharpness']:.1f}"
                          if self._recog_best_face else "none")
+            silent = "" if apologise else \
+                f" (silent — within {SEE_COMPLAINT_COOLDOWN:.0f}s cooldown)"
             print(f"Task[recog_greeting]: unknown face not sharp enough "
-                  f"(best sharpness={sharp_str}, threshold={SHARPNESS_THRESHOLD}) "
-                  f"-> cooldown", flush=True)
+                  f"(best sharpness={sharp_str}, threshold={SHARPNESS_THRESHOLD})"
+                  f"{silent} -> cooldown", flush=True)
             result.status_event = STATUS_NOT_RECOGNIZED
             return result
 
