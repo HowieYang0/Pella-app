@@ -61,6 +61,14 @@ USB_MIC_DEVICE_NAME   = "Samson" # substring match against PyAudio device names
 USB_MIC_SAMPLE_RATE   = 16000    # capture at ASR rate — no resampling needed
 USB_MIC_CHANNELS      = 1
 USB_NOISE_FLOOR_INIT   = 300.0   # lower starting estimate — no motors on the dock
+USB_NOISE_FLOOR_CEIL   = 600.0   # hard ceiling on the adaptive EMA. Without it the
+                                 # floor drifts monotonically up over a long session
+                                 # (300 -> 2000+ observed) — leaked speech and
+                                 # quiet motor noise contaminate the non-speech
+                                 # EMA buckets. Once the floor crosses ~1000 the
+                                 # peak/floor SNR collapses and Whisper starts
+                                 # rejecting or hallucinating speech that earlier
+                                 # in the session would have transcribed cleanly.
 USB_NOISE_FLOOR_FACTOR = 1.2     # RMS entry threshold; speech at 3ft peaks well above floor×factor
                                  # Lowered from 1.5 → 1.2 with new mic bracket
                                  # so voice frames clear the entry threshold
@@ -369,7 +377,10 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
             if not vad["in_speech"]:
                 alpha = 0.05 if vad["frame_count"] < USB_WARMUP_FRAMES \
                         else NOISE_FLOOR_EMA_ALPHA
-                vad["noise_floor"] = alpha * rms + (1.0 - alpha) * vad["noise_floor"]
+                vad["noise_floor"] = min(
+                    USB_NOISE_FLOOR_CEIL,
+                    alpha * rms + (1.0 - alpha) * vad["noise_floor"],
+                )
 
             if vad["frame_count"] < USB_WARMUP_FRAMES:
                 continue  # floor still stabilising — suppress all triggers

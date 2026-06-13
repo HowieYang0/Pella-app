@@ -85,7 +85,14 @@ ENROLL_MAX_ATTEMPTS  = 3      # how many times Pella will ask for the name
                               # a fresh ENROLL_LISTEN_WINDOW. After this
                               # many total attempts have failed, enrollment
                               # closes silently — no further apologies.
-SHARPNESS_THRESHOLD  = 80.0   # min Laplacian variance for an enrollment-quality face
+SHARPNESS_THRESHOLD  = 60.0   # min Laplacian variance for engagement. Lowered
+                              # from 80 -> 60 because borderline-close faces
+                              # (~75 sharpness) were being refused with
+                              # "Sorry, I cannot see you clearly" even though
+                              # the actual enrollment top-K candidates the
+                              # system accepts include sharpness values in
+                              # the 50-70 range — the engagement gate was
+                              # stricter than the enrollment-quality gate.
 ENROLL_BUFFER_SIZE   = 40     # max # of candidate face captures retained
                               # during introducing. With YuNet running every
                               # FACE_DETECT_EVERY ticks at ~6 detections/sec
