@@ -44,7 +44,7 @@ from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, SEE_COMPLAINT_COOLDOWN,
     ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
-    ENROLL_TIMEOUT, ENROLL_MAX_ATTEMPTS, CORRECTION_WINDOW,
+    ENROLL_TIMEOUT, ENROLL_MAX_ATTEMPTS, CONFIRM_TIMEOUT_SEC, CORRECTION_WINDOW,
     FACE_IDS_DIR, SHARPNESS_THRESHOLD,
     ENROLL_BUFFER_SIZE, ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
     ENROLL_BRIGHT_LO, ENROLL_BRIGHT_HI, ENROLL_BRIGHT_MIN_STD, ENROLL_TOP_K,
@@ -127,6 +127,7 @@ _NON_NAME_WORDS = {
     "what", "where", "when", "who", "why", "how", "which",
     # Interjections / common responses
     "yes", "no", "ok", "okay", "yeah", "nah", "uh", "um", "oh",
+    "hmm", "huh", "ugh", "eh", "mm", "mmm", "hm",
     "hi", "hey", "hello", "bye",
     # Polite / imperative words seen in mis-captures
     "please", "thanks", "thank", "sorry",
@@ -141,6 +142,84 @@ _NON_NAME_WORDS = {
     "true", "false", "late", "early", "easy", "hard", "fun", "old",
     "new", "big", "small", "first", "last",
 }
+
+
+# Hoisted to module scope so _has_intro_phrase() can reuse it without
+# recompiling the regex per call. Same pattern as previously defined inside
+# _parse_name — see that function's docstring for what each alternative
+# matches and why.
+_INTRO_RE = re.compile(
+    r"(?:i am|i'm|i'?m\s+called|my\s+name\s+is|my\s+name'?s|name'?s|"
+    r"call\s+me|this\s+is|it'?s|it\s+is|that'?s|that\s+is)\s+(.+)",
+    re.IGNORECASE,
+)
+
+# Yes / no patterns for the "Did you say {name}?" confirmation reply.
+# Matched against the lowercased, punctuation-stripped transcript.
+# Anchored to start because we want the user's leading word to be the
+# affirmation/rejection — "yes, joy" / "no, joy" — not a buried token.
+_YES_RE = re.compile(
+    r"^(?:yes|yeah|yep|yup|sure|right|correct|that'?s\s+right|"
+    r"that\s+is\s+right|ok|okay)\b",
+    re.IGNORECASE,
+)
+_NO_RE = re.compile(
+    r"^(?:no|nope|nah|wrong|incorrect|not\s+quite|that'?s\s+wrong)\b(.*)",
+    re.IGNORECASE,
+)
+
+
+def _has_intro_phrase(text: str) -> bool:
+    """True iff the transcript contains an explicit name-intro phrase.
+
+    Used to decide whether a parsed name needs confirmation. A bare-word
+    transcript ("Joy" -> "Enjoy" via Whisper) goes through "Did you say X?"
+    because it's the hallucination failure mode; "My name is Joy" goes
+    straight to enrollment because it carries enough acoustic context for
+    Whisper to commit confidently.
+    """
+    return _INTRO_RE.search(text) is not None
+
+
+def _parse_confirmation(text: str):
+    """Parse a yes / no / correction reply to "Did you say {name}?".
+
+    Returns a tuple (verdict, new_name):
+      verdict   : "yes" | "no" | "unclear"
+      new_name  : a name parsed out of a "no, X" / "it's Y" / "my name
+                  is Z" reply, or None.
+
+    "yes" → commit the originally-parsed name.
+    "no" with new_name → commit the new name instead.
+    "no" without new_name → re-prompt for the name (consumes a retry slot).
+    "unclear" → ignore and keep waiting; tick() handles the timeout.
+    """
+    t = re.sub(r"[.,!?]+", " ", text.strip())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return ("unclear", None)
+
+    # Check "no" first, because "no, joy" should NOT be confused with a
+    # bare-name parse of "joy" alone — the leading "no" is the signal.
+    no_match = _NO_RE.match(t)
+    if no_match:
+        rest = no_match.group(1).strip(" ,.;:-")
+        if rest:
+            new_name = _parse_name(rest)
+            if new_name:
+                return ("no", new_name)
+        return ("no", None)
+
+    if _YES_RE.match(t):
+        return ("yes", None)
+
+    # No explicit yes/no leading word — treat any successfully-parsed name
+    # as an implicit correction ("Joy." / "It's Joy." / "My name is Joy.").
+    new_name = _parse_name(t)
+    if new_name:
+        return ("no", new_name)
+
+    return ("unclear", None)
 
 
 def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
@@ -163,20 +242,7 @@ def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
     # arrives after a stitch from the next clip.
     t = re.sub(r"\.{2,}", " ", t)
     t = re.split(r"[.!?]", t, maxsplit=1)[0].strip()
-    # Handles the most common name-intro phrasings. The apostrophe-s
-    # contractions ("my name's", "name's") show up frequently in
-    # Whisper transcripts even when the speaker said the full "my name is".
-    #
-    # "it's X" / "that's X" are weak proper-noun pointers that Whisper
-    # often substitutes for "my name is X" — accepting them recovers the
-    # common journal failure "It's Jenny" -> rejected -> apologise.
-    # False-positive state replies ("It's fine", "That's right") are
-    # caught by the _NON_NAME_WORDS filter below.
-    intro_re = re.compile(
-        r"(?:i am|i'm|i'?m\s+called|my\s+name\s+is|my\s+name'?s|name'?s|"
-        r"call\s+me|this\s+is|it'?s|it\s+is|that'?s|that\s+is)\s+(.+)",
-        re.IGNORECASE,
-    )
+    intro_re = _INTRO_RE
     # Loop because a stitched transcript can look like "my name is ... my
     # name is Joy" — peeling off only the first intro phrase would leave
     # "my name is Joy" and trip the non-name-word filter on "my". Strip
@@ -358,6 +424,21 @@ class RecogGreetingTask:
         # to be a poor-pose capture).
         self._enroll_candidates: deque = deque(maxlen=ENROLL_BUFFER_SIZE)
 
+        # Confirmation state: a bare-name parse from the introducing window
+        # (e.g. Whisper transcribed "Enjoy" for the user's slow "My name is
+        # Joy") routes here instead of enrolling immediately. Pella asks
+        # "Did you say {display_name}?" and listens for a yes / no /
+        # correction reply, deciding whether to commit the original name,
+        # commit a corrected one, or re-prompt. Multi-word intro-phrase
+        # transcripts skip this — they have enough acoustic context that
+        # Whisper rarely substitutes a wrong name.
+        self._confirm_state = {
+            "active":       False,
+            "dir_name":     None,    # candidate canonical key
+            "display_name": None,    # candidate human form
+            "asked_at":     0.0,     # monotonic time we asked the question
+        }
+
         # Correction state: after Pella greets/introduces someone, the user
         # has CORRECTION_WINDOW seconds to say "my name is X" to rename them.
         # `opened_at` is the monotonic time the window was opened (which is
@@ -439,6 +520,17 @@ class RecogGreetingTask:
                 and now - self._enroll_state["asked_at"] >= ENROLL_TIMEOUT:
             self._apologise_and_arm_retry_or_close(
                 now, "enrollment timeout, no name received")
+
+        # Confirmation timeout: "Did you say X?" went unanswered. Default
+        # to "yes" — assume the original parse was correct. Better to
+        # enroll a possibly-wrong name (recoverable via the correction
+        # window) than to drop the interaction entirely.
+        if self._confirm_state["active"] \
+                and now - self._confirm_state["asked_at"] >= CONFIRM_TIMEOUT_SEC:
+            display_name = self._confirm_state["display_name"]
+            print(f"Task[recog_greeting]: confirmation timeout for "
+                  f"'{display_name}' — assuming yes", flush=True)
+            self._commit_enrollment(now, display_name)
 
         # ── RESPOND: advance the state machine ───────────────────────────
         result = TickResult(latest_frame=img, latest_faces=self._last_faces)
@@ -548,6 +640,15 @@ class RecogGreetingTask:
                 # window open in case another transcript arrives soon
                 # (e.g. user clarifies). Don't consume; fall through.
 
+        # Confirmation window takes precedence over fresh enrollment too:
+        # if Pella just asked "Did you say X?", a reply during that window
+        # is a yes/no/correction — not a new name to parse.
+        if self._confirm_state["active"]:
+            if self._handle_confirmation_reply(now, text, capture_t):
+                return True
+            # Out-of-window transcript — fall through to normal handling
+            # (which will likely drop it because enroll_state is inactive).
+
         if not self._enroll_state["active"]:
             return False
 
@@ -609,6 +710,31 @@ class RecogGreetingTask:
                   f"continuation", flush=True)
             return True
 
+        # If the user said only a bare name ("Joy") rather than a full
+        # intro phrase ("My name is Joy"), Whisper is prone to single-
+        # word substitutions ("Joy" -> "Enjoy" / "Destroy"). Route through
+        # an explicit confirmation step before we persist anything to
+        # disk. Multi-word intro-phrase transcripts skip this — they
+        # carry enough acoustic context that Whisper rarely substitutes.
+        if not _has_intro_phrase(combined_text):
+            self._enter_confirming(now, name_raw)
+            return True
+
+        return self._commit_enrollment(now, name_raw)
+
+    # ── Enrollment commit (shared by direct + post-confirmation paths) ───
+
+    def _commit_enrollment(self, now: float, name_raw: str) -> bool:
+        """Persist the top-K face captures under the name, queue the
+        "Nice to meet you" TTS, and open the correction window.
+
+        Called from two places:
+          * submit_transcript() directly when an intro-phrase transcript
+            ("My name is X") parses — high-confidence path, no confirm.
+          * after a bare-name transcript has been confirmed ("Did you
+            say X?" → "Yes" / timeout / "No, Y") in
+            _handle_confirmation_reply / the tick timeout.
+        """
         dir_name     = name_raw.lower().replace(" ", "_")
         display_name = name_raw.title()
         save_dir     = os.path.join(FACE_IDS_DIR, dir_name)
@@ -666,6 +792,7 @@ class RecogGreetingTask:
                             best["frame"])
             enrolled = True
         self._enroll_state["active"] = False
+        self._confirm_state["active"] = False
 
         try:
             if enrolled:
@@ -686,6 +813,96 @@ class RecogGreetingTask:
             # Open the correction window so a follow-up "My name is X"
             # can rename a mishear (e.g. "Willie" -> "William").
             self._open_correction_window(now, dir_name, display_name)
+        return True
+
+    # ── Confirmation: "Did you say {name}?" ──────────────────────────────
+
+    def _enter_confirming(self, now: float, name_raw: str) -> None:
+        """Pause enrollment and ask the user to confirm a bare-name parse.
+
+        Sets _enroll_state inactive (so the enrollment timeout stops
+        ticking) and _confirm_state active (so the confirmation timeout
+        starts). The phase stays INTRODUCING — _tick_introducing won't
+        exit to COOLDOWN while either of these is active.
+        """
+        dir_name     = name_raw.lower().replace(" ", "_")
+        display_name = name_raw.title()
+        try:
+            self._say_queue.put_nowait(f"Did you say {display_name}?")
+        except Exception as e:
+            print(f"Task[recog_greeting]: WARN say_queue full, "
+                  f"confirmation not queued: {e}", flush=True)
+        # Stale stitch buffer would otherwise glue onto the yes/no reply.
+        self._enroll_pending = {"text": None, "speech_end_t": 0.0,
+                                "expires_at": 0.0}
+        # Pause the enrollment-side timeout; confirmation has its own.
+        self._enroll_state["active"] = False
+        self._confirm_state.update({
+            "active":       True,
+            "dir_name":     dir_name,
+            "display_name": display_name,
+            "asked_at":     now,
+        })
+        print(f"Task[recog_greeting]: bare-name parse '{display_name}' "
+              f"-> confirming ('Did you say {display_name}?')", flush=True)
+
+    def _handle_confirmation_reply(self, now: float, text: str,
+                                   capture_t: float) -> bool:
+        """Route a transcript that arrived during the confirmation window.
+
+        Returns True iff the transcript was consumed (taken to mean a
+        yes/no/correction reply), False to let the caller fall through.
+
+        "yes" / timeout (handled in tick)  → commit the original name.
+        "no" with new_name                  → commit the new name.
+        "no" alone                          → re-prompt for the name
+                                             (consumes an attempt).
+        "unclear"                           → don't consume, keep waiting.
+        """
+        asked_at = self._confirm_state["asked_at"]
+        # Lookback small (1 s) — the user can't have replied to the prompt
+        # before it started playing, but VAD-stamped capture_t can sit
+        # slightly earlier than the TTS-end if the user spoke during the
+        # tail. Drop anything older than that.
+        if capture_t < asked_at - 1.0:
+            return False
+        if capture_t > asked_at + CONFIRM_TIMEOUT_SEC:
+            # Tick should have already fired the timeout; defensive.
+            return False
+
+        verdict, new_name = _parse_confirmation(text)
+        display_name = self._confirm_state["display_name"]
+        if verdict == "yes":
+            print(f"Task[recog_greeting]: confirmation 'yes' for "
+                  f"'{display_name}' (heard {text!r})", flush=True)
+            self._commit_enrollment(now, display_name)
+            return True
+        if verdict == "no":
+            if new_name:
+                print(f"Task[recog_greeting]: confirmation 'no' for "
+                      f"'{display_name}' with correction '{new_name}' "
+                      f"(heard {text!r})", flush=True)
+                # New name is itself from a fresh transcript; if THAT
+                # came in via a bare-name path inside the "no, X" form,
+                # we still commit directly — the user already gave us
+                # one round of explicit confirmation context.
+                self._commit_enrollment(now, new_name)
+                return True
+            # "no" alone — reopen enrollment listening and apologise.
+            # Reactivate enroll_state so _apologise_and_arm_retry_or_close
+            # treats this as a fresh attempt-failure and re-asks.
+            print(f"Task[recog_greeting]: confirmation 'no' for "
+                  f"'{display_name}' without correction (heard {text!r}) "
+                  f"-> re-asking", flush=True)
+            self._confirm_state["active"] = False
+            self._enroll_state["active"]  = True
+            self._enroll_state["asked_at"] = now
+            self._apologise_and_arm_retry_or_close(
+                now, "user rejected confirmed name")
+            return True
+        # Unclear — keep waiting for a clearer reply or the timeout.
+        print(f"Task[recog_greeting]: confirmation reply unclear "
+              f"(heard {text!r}) — keep waiting", flush=True)
         return True
 
     # ── Correction window ────────────────────────────────────────────────
@@ -1276,6 +1493,9 @@ class RecogGreetingTask:
                                 "expires_at": 0.0}
         self._enroll_state.update({"active": True, "asked_at": now,
                                    "attempts": 1})
+        # Any leftover confirmation state from a prior introducing
+        # session would otherwise gate cooldown forever.
+        self._confirm_state["active"] = False
         self._last_introduced  = now
         self._last_motion_time = now
 
@@ -1302,9 +1522,14 @@ class RecogGreetingTask:
         return result
 
     def _tick_introducing(self, now, result: TickResult) -> TickResult:
-        # Driven by submit_transcript / the enrollment timeout check above;
-        # both flip enroll_state["active"] back to False when done.
-        if not self._enroll_state["active"]:
+        # Driven by submit_transcript / the enrollment + confirmation
+        # timeout checks above; the commit and apology paths flip both
+        # _enroll_state["active"] and _confirm_state["active"] back to
+        # False. Stay in INTRODUCING while either is still live so a
+        # bare-name parse waiting on "Did you say X?" doesn't leak into
+        # COOLDOWN before the user has a chance to reply.
+        if not self._enroll_state["active"] \
+                and not self._confirm_state["active"]:
             self._phase         = COOLDOWN
             self._phase_entered = now
             print("Task[recog_greeting]: introducing complete -> cooldown",

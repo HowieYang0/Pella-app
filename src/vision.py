@@ -85,6 +85,15 @@ ENROLL_MAX_ATTEMPTS  = 3      # how many times Pella will ask for the name
                               # a fresh ENROLL_LISTEN_WINDOW. After this
                               # many total attempts have failed, enrollment
                               # closes silently — no further apologies.
+CONFIRM_TIMEOUT_SEC  = 8.0    # listening window after "Did you say {name}?"
+                              # for a yes/no/correction reply. Single-word
+                              # bare-name transcripts ("Enjoy" / "Destroy")
+                              # are routed through this confirmation step
+                              # because they're the Whisper-hallucination
+                              # failure mode; multi-word intro-phrase
+                              # transcripts ("My name is X") skip it and
+                              # enroll directly. Timeout = assume the
+                              # original parse was correct.
 SHARPNESS_THRESHOLD  = 60.0   # min Laplacian variance for engagement. Lowered
                               # from 80 -> 60 because borderline-close faces
                               # (~75 sharpness) were being refused with
