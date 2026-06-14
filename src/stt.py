@@ -22,7 +22,15 @@ except ImportError:
 ROBOT_SAMPLE_RATE     = 48000
 ASR_CHANNELS          = 2
 ASR_SAMPLE_RATE       = 16000
-TTS_MUTE_SEC          = 4.0    # mute mic this long after TTS plays
+TTS_MUTE_SEC          = 2.0    # mute mic this long after TTS plays. This is
+                               # the FALLBACK floor — only used when
+                               # rt/audiohub/player/state can t shorten the
+                               # mute via the actual stopped event (e.g.
+                               # subscription drop, Wi-Fi hiccup). Lowered
+                               # from 4 -> 2 because the state-topic-based
+                               # shortening makes the typical mute end at
+                               # actual_audio_end + REVERB_PAD_SEC, so the
+                               # floor only matters in the failure case.
 SPEAKER_VOLUME        = 7      # robot speaker volume 0–10
 
 VAD_AGGRESSIVENESS    = 1      # webrtcvad: 0 = permissive, 3 = strict

@@ -187,6 +187,17 @@ def _run_robot_loop(robot_ip, frame_queue, say_queue, prep_queue,
                     _make_gpt_feedback_handler(transcript_queue),
                 )
 
+                # AudioHub playback state — ~4 Hz heartbeat reporting current
+                # play state. tts.py uses the playing -> stopped transition
+                # to shorten tts_mute_until and release the mic as soon as
+                # actual audio finishes, rather than waiting for the time-
+                # based fallback. Schema verified via
+                # scripts/probe_audiohub_state.py.
+                conn.datachannel.pub_sub.subscribe(
+                    RTC_TOPIC["AUDIO_HUB_PLAY_STATE"],
+                    tts.make_player_state_callback(),
+                )
+
                 # Mouth — initialise the AudioHub and set speaker volume.
                 try:
                     audiohub = WebRTCAudioHub(conn)

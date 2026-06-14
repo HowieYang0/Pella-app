@@ -139,12 +139,85 @@ def _wav_duration(path: str) -> float:
         return 0.0
 
 
-# How much extra to add on top of the WAV duration when sizing the mute.
-# Covers: play_by_uuid request acknowledge (~0.2 s) + speaker buffering
-# (~0.3 s) + room reverb tail (~0.5 s). Generous on purpose — mute lifting
-# slightly late costs a fraction of a second of listening; lifting too early
-# costs a self-hear and a bogus transcript.
-MUTE_BUFFER_SEC = 1.0
+# Extra padding on top of the WAV duration when sizing the fallback mute
+# window. With option 1 (set mute deadline AFTER play_by_uuid returns) the
+# ~0.2 s RPC roundtrip is no longer inside the budget — audio starts ~50 ms
+# after that point. So this only needs to cover startup latency (~50 ms) +
+# reverb tail (~150 ms) + safety margin. Lowered from 1.0 -> 0.4 because
+# the rt/audiohub/player/state subscription typically shortens the mute via
+# the actual stopped event well before this fallback fires; this floor only
+# matters when the topic is unavailable.
+MUTE_BUFFER_SEC = 0.4
+
+# After the rt/audiohub/player/state callback detects the playing -> stopped
+# transition, hold the mic muted for this much longer to absorb (a) the
+# heartbeat-sampling slop (~125 ms avg between actual end and our detection)
+# and (b) the room reverb tail. 100 ms is comfortable for a typical home/
+# office room and well below human reaction time (~200-500 ms) so doesn t
+# eat the start of the user s reply.
+REVERB_PAD_SEC = 0.1
+
+
+# ── rt/audiohub/player/state subscription ────────────────────────────────────
+#
+# The Go2 publishes a ~4 Hz heartbeat with current playback state:
+#   {"play_state": "in_use" | "not_in_use",
+#    "is_playing": true | false,
+#    "current_audio_unique_id": "...",
+#    "current_audio_custom_name": "..."}
+# It s not edge-triggered — every tick reports the current state, even when
+# idle. We synthesize edges ourselves by comparing against the previous
+# is_playing bool and react only to transitions. On playing -> stopped we
+# shorten tts_mute_until[0] so the mic re-opens shortly after the actual
+# end of audio rather than at the conservative time-based fallback.
+_player_state = {
+    "is_playing":   False,
+    "current_uuid": "",
+}
+
+
+def make_player_state_callback():
+    """Return a callback to wire onto rt/audiohub/player/state.
+
+    Caller is pella_main, which subscribes during WebRTC bring-up. The
+    callback never EXTENDS tts_mute_until — only shortens it on a
+    detected stopped event — so a delayed or missing topic message can t
+    cause the mic to re-open too early; the time-based fallback in speak()
+    is always the upper bound.
+    """
+    def _on_player_state(message):
+        try:
+            inner = message.get("data") if isinstance(message, dict) else None
+            if isinstance(inner, str):
+                inner = json.loads(inner)
+            if not isinstance(inner, dict):
+                return
+            is_playing = bool(inner.get("is_playing", False))
+            uuid = str(inner.get("current_audio_unique_id", "") or "")
+        except Exception:
+            return
+
+        prev_playing = _player_state["is_playing"]
+        if is_playing == prev_playing:
+            return   # heartbeat with no change — skip
+
+        _player_state["is_playing"]   = is_playing
+        _player_state["current_uuid"] = uuid
+
+        if not is_playing and prev_playing:
+            # playing -> stopped: actual audio just ended (within the
+            # ~125 ms heartbeat resolution). Shorten the mute to now +
+            # REVERB_PAD_SEC. Never lengthen it.
+            now = time.monotonic()
+            new_deadline = now + REVERB_PAD_SEC
+            if new_deadline < tts_mute_until[0]:
+                saved = tts_mute_until[0] - new_deadline
+                tts_mute_until[0] = new_deadline
+                print(f"TTS: stopped event — shortening mute by "
+                      f"{saved*1000:.0f}ms (now +{REVERB_PAD_SEC*1000:.0f}ms)",
+                      flush=True)
+
+    return _on_player_state
 
 
 def invalidate_audiohub_uuids(cache: dict) -> int:
@@ -288,23 +361,24 @@ async def speak(text: str, audiohub, cache: dict):
                         break
 
         if entry["uuid"]:
-            # Mute the USB mic for the actual audio length + a safety buffer.
-            # Fixed TTS_MUTE_SEC was 4 s, which under-covered long utterances
-            # like "Hello, I am Pella. What is your name?" (~3.5 s audio +
-            # ~0.5 s playback latency), causing the tail to leak into the
-            # mic and be re-transcribed as "Pella".
+            # Compute the time-based mute fallback (used if the state-topic
+            # callback doesn t shorten it via a real stopped event).
             mute_dur = max(
                 entry.get("duration", 0.0) + MUTE_BUFFER_SEC,
-                TTS_MUTE_SEC,  # never shorter than the legacy floor
+                TTS_MUTE_SEC,
             )
-            mute_t = time.monotonic() + mute_dur
-            tts_mute_until[0] = mute_t   # USB-mic path reads this to self-mute
-            print(f"TTS {tag} playing {repr(preview)} "
-                  f"(mute until +{mute_dur:.1f}s)", flush=True)
             t0 = time.monotonic()
             await audiohub.play_by_uuid(entry["uuid"])
-            print(f"TTS {tag} play_by_uuid_call: "
-                  f"{time.monotonic()-t0:.2f}s (done)", flush=True)
+            # Set the deadline AFTER the RPC roundtrip rather than before.
+            # play_by_uuid takes ~200 ms over WebRTC, but actual audio
+            # doesn t start emitting until ~50 ms after that. Anchoring
+            # the deadline to the post-return clock removes the ~200 ms
+            # we were previously burning from the budget.
+            tts_mute_until[0] = time.monotonic() + mute_dur
+            print(f"TTS {tag} playing {repr(preview)} "
+                  f"(mute until +{mute_dur:.1f}s, "
+                  f"play_by_uuid_call: {time.monotonic()-t0:.2f}s done)",
+                  flush=True)
         else:
             print(f"TTS {tag} NO UUID for {repr(preview)} — playback skipped",
                   flush=True)
