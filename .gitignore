@@ -16,6 +16,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+._*
 
 # Local backups created during refactors
 *.bak
@@ -28,3 +29,12 @@ venv/
 data/models/w600k_r50.onnx
 data/models/res10_300x300_ssd_iter_140000.caffemodel
 data/models/deploy.prototxt
+
+# Face enrollment data — personal/PII, kept local only. Each dev box and
+# the dock have their own data/face_ids/ trees; never sync via git.
+data/face_ids/
+
+# Diagnostic mic dumps written by stt.configure_debug_audio_dir() during
+# enrollment listening windows. Same PII concern as face_ids/ — keep
+# local, review on the dock, clean up periodically.
+data/debug_audio/

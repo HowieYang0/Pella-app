@@ -2,6 +2,8 @@
 """Speech-to-text pipeline: Whisper transcription, VAD, and USB mic capture."""
 
 import concurrent.futures
+import os
+import re
 import threading
 import time
 from collections import deque
@@ -22,6 +24,15 @@ except ImportError:
 ROBOT_SAMPLE_RATE     = 48000
 ASR_CHANNELS          = 2
 ASR_SAMPLE_RATE       = 16000
+NO_SPEECH_THRESHOLD   = 0.3    # Whisper s no_speech_prob cutoff. Lowered from
+                               # 0.5 -> 0.3 to be more forgiving of marginal
+                               # speech (quiet voice at distance, brief
+                               # utterances inside a noisier 6 s VAD buffer).
+                               # Trade-off: slightly more hallucinations on
+                               # pure-noise clips — those are now caught by
+                               # the name-confirmation flow in
+                               # recog_greeting and by the echo filter
+                               # below for TTS-leakage cases.
 TTS_MUTE_SEC          = 2.0    # mute mic this long after TTS plays. This is
                                # the FALLBACK floor — only used when
                                # rt/audiohub/player/state can t shorten the
@@ -99,6 +110,141 @@ USB_PRE_ROLL_FRAMES    = 80      # audio kept before onset (~1.6 s) to capture s
 
 # Shared mutable: TTS sets this so the USB mic loop mutes itself during playback.
 tts_mute_until = [0.0]
+
+
+# ── Diagnostic audio-clip dump ────────────────────────────────────────────────
+#
+# When enabled, every clip that flushes during an armed window is saved as
+# <timestamp>.wav with a sidecar <timestamp>.txt listing the context (what
+# TTS armed the window), the clip duration, the age-when-sent, and Whisper s
+# transcript. The point is to listen back when Pella doesn t catch a reply
+# and decide whether the audio actually contained recognisable speech or
+# was genuinely empty / too quiet / too noisy.
+#
+# Lifecycle:
+#   pella_main: stt.configure_debug_audio_dir("…/data/debug_audio")  at startup
+#   recog_greeting: stt.arm_debug_audio_window(15, context="…")  after each
+#       enrollment TTS so the listening window is captured.
+_debug_audio_dir = [None]
+_debug_audio_state = {
+    "until":   0.0,    # monotonic deadline; older = window closed
+    "context": "",     # what TTS armed the window; written to the sidecar
+    "counter": 0,      # filename serial within the process
+}
+
+
+def configure_debug_audio_dir(path):
+    """Enable (or disable) diagnostic clip dumping.
+
+    Pass a directory path to enable; pass None or "" to disable. The
+    directory is created if missing. Until arm_debug_audio_window() opens
+    a window, no clips are saved even when enabled.
+    """
+    if path:
+        os.makedirs(path, exist_ok=True)
+        _debug_audio_dir[0] = path
+        print(f"Debug audio: enabled, saving to {path}", flush=True)
+    else:
+        _debug_audio_dir[0] = None
+
+
+def arm_debug_audio_window(duration_sec, context=""):
+    """Open a window during which captured clips get saved alongside their
+    transcripts. Re-arming extends the deadline.
+    """
+    _debug_audio_state["until"]   = time.monotonic() + duration_sec
+    _debug_audio_state["context"] = context
+
+
+def _debug_save_wav(samples, sample_rate):
+    """Save a WAV if armed + enabled. Returns the path or None."""
+    if _debug_audio_dir[0] is None:
+        return None
+    if time.monotonic() >= _debug_audio_state["until"]:
+        return None
+    import wave
+    from datetime import datetime
+    _debug_audio_state["counter"] += 1
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base  = f"{stamp}_{_debug_audio_state['counter']:04d}"
+    path  = os.path.join(_debug_audio_dir[0], base + ".wav")
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes(samples.tobytes())
+        return path
+    except Exception as e:
+        print(f"Debug audio: WAV save failed: {e}", flush=True)
+        return None
+
+
+def _debug_save_txt(wav_path, context, clip_sec, speech_start_t,
+                    transcript=None, reason=None):
+    """Sidecar metadata next to a dumped WAV — context + transcript so we
+    can review which question this audio was supposed to be answering."""
+    if not wav_path:
+        return
+    txt_path = wav_path[:-4] + ".txt"
+    try:
+        with open(txt_path, "w") as f:
+            f.write(f"context: {context}\n")
+            f.write(f"clip_sec: {clip_sec:.2f}\n")
+            f.write(f"age_when_sent_sec: "
+                    f"{time.monotonic() - speech_start_t:.2f}\n")
+            f.write(f"transcript: "
+                    f"{transcript if transcript else '<no speech detected>'}\n")
+            if reason:
+                f.write(f"flagged: {reason}\n")
+    except Exception as e:
+        print(f"Debug audio: txt save failed: {e}", flush=True)
+
+
+# ── TTS-echo filter ───────────────────────────────────────────────────────────
+#
+# Even with the mic-mute mechanism, fragments of Pella s own speech can
+# occasionally leak into the capture (long playback tail, network jitter,
+# room reverb past the mute deadline). When that happens Whisper transcribes
+# something like "Pella" or "What is your name" which then gets routed to
+# the task as if the user said it.
+#
+# tts.py calls note_tts_play(text, duration) when each phrase starts playing.
+# After Whisper transcribes, _is_echo() checks whether the transcript looks
+# like a fragment of that recent TTS — and if so, the transcript is dropped
+# before reaching the queue.
+_recent_tts = {
+    "text":    "",
+    "ends_at": 0.0,
+}
+
+
+def note_tts_play(text, duration_sec):
+    """Record what TTS just started playing so the ASR can filter echoes."""
+    _recent_tts["text"]    = text or ""
+    _recent_tts["ends_at"] = time.monotonic() + max(0.0, duration_sec)
+
+
+def _is_echo(transcript, speech_start_t):
+    """Conservative: only flag as echo when speech started during/just after
+    the TTS audio AND every word in the transcript is a word from the TTS.
+    Won t filter unrelated speech that incidentally shares a word."""
+    if not _recent_tts["text"]:
+        return False
+    # If the user started speaking after TTS had finished plus a small grace,
+    # leakage can t be the source — must be genuine speech.
+    if speech_start_t > _recent_tts["ends_at"] + 1.0:
+        return False
+    tts_lower = _recent_tts["text"].lower()
+    test = re.sub(r"[^a-z ]", " ", transcript.lower())
+    test = re.sub(r"\s+", " ", test).strip()
+    if not test:
+        return False
+    tts_words  = set(re.findall(r"[a-z]+", tts_lower))
+    test_words = test.split()
+    if not test_words:
+        return False
+    return all(w in tts_words for w in test_words)
 
 
 # ── Whisper model ─────────────────────────────────────────────────────────────
@@ -182,7 +328,7 @@ def transcribe(samples: np.ndarray,
             segments, _ = _whisper.transcribe(
                 audio_16k, language="en", beam_size=5,
                 vad_filter=True, condition_on_previous_text=False,
-                no_speech_threshold=0.5,
+                no_speech_threshold=NO_SPEECH_THRESHOLD,
                 # Language-model hint that biases Whisper toward the name-
                 # introduction patterns we actually listen for, away from
                 # frequent-English hallucinations ("It's Alison" / "Hey
@@ -193,7 +339,8 @@ def transcribe(samples: np.ndarray,
                                 "My name is William. Call me Sam. "
                                 "I am Joy."),
             )
-            parts = [seg.text.strip() for seg in segments if seg.no_speech_prob < 0.5]
+            parts = [seg.text.strip() for seg in segments
+                     if seg.no_speech_prob < NO_SPEECH_THRESHOLD]
         else:
             import torch as _torch
             result = _whisper.transcribe(
@@ -202,7 +349,7 @@ def transcribe(samples: np.ndarray,
                 condition_on_previous_text=False,
             )
             parts = [s["text"].strip() for s in result.get("segments", [])
-                     if s.get("no_speech_prob", 0) < 0.5]
+                     if s.get("no_speech_prob", 0) < NO_SPEECH_THRESHOLD]
 
         return " ".join(parts).strip()
 
@@ -330,6 +477,13 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
               f"(speech started {time.monotonic() - speech_start_t:.1f}s ago)",
               flush=True)
 
+        # Save WAV for diagnostic review if we re inside an armed window.
+        # The sidecar .txt is written from _run() once Whisper returns, so
+        # the file pairs the audio with the transcript and "stale"/"echo"
+        # flagging.
+        debug_wav_path = _debug_save_wav(samples, USB_MIC_SAMPLE_RATE)
+        debug_context  = _debug_audio_state["context"] if debug_wav_path else ""
+
         def _run():
             # Drop stale clips: with max_workers=1 the executor serialises,
             # and on a CPU-only Jetson a 6 s burst of speech can sit ~10 s
@@ -341,18 +495,29 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                 print(f"ASR: skipping stale {clip_sec:.1f}s clip "
                       f"({age:.1f}s old, > {MAX_CLIP_AGE_SEC:.0f}s cutoff)",
                       flush=True)
+                _debug_save_txt(debug_wav_path, debug_context, clip_sec,
+                                speech_start_t, transcript=None, reason="stale")
                 return
             text = transcribe(samples, src_sr=USB_MIC_SAMPLE_RATE,
                               nr_prop=USB_NR_PROP_DECREASE)
-            if text:
+            echo = bool(text) and _is_echo(text, speech_start_t)
+            if text and not echo:
                 print(f"Heard: {text}", flush=True)
                 try:
                     transcript_queue.put_nowait(
                         (text, speech_start_t, speech_end_t))
                 except Exception:
                     pass
+            elif echo:
+                print(f"ASR: discarding likely TTS echo of "
+                      f"{_recent_tts['text']!r}: {text!r}", flush=True)
             else:
                 print("ASR: no speech detected in clip", flush=True)
+            _debug_save_txt(
+                debug_wav_path, debug_context, clip_sec, speech_start_t,
+                transcript=text or "",
+                reason=("echo" if echo else None),
+            )
 
         asr_executor.submit(_run)
 

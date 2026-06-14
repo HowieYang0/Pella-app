@@ -64,6 +64,7 @@ import stt
 import task_manager
 import tts
 from stt import USE_USB_MIC, SPEAKER_VOLUME
+import vision
 from vision import annotate
 
 
@@ -305,6 +306,10 @@ def main():
 
     # Ear — USB-mic VAD + Whisper, writes into transcript_queue.
     if USE_USB_MIC:
+        # Enable diagnostic clip dumping. recog_greeting calls
+        # stt.arm_debug_audio_window() after each enrollment-prompt TTS so
+        # only the user-reply listening windows get saved (not every clip).
+        stt.configure_debug_audio_dir(vision.DEBUG_AUDIO_DIR)
         threading.Thread(
             target=stt.run_usb_mic,
             args=(transcript_queue, stop_event),

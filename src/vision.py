@@ -147,6 +147,7 @@ YUNET_PATH   = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
 _PROTO       = os.path.join(MODELS_DIR, "deploy.prototxt")
 _WEIGHTS     = os.path.join(MODELS_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
 FACE_IDS_DIR = os.path.join(DATA_DIR, "face_ids")
+DEBUG_AUDIO_DIR = os.path.join(DATA_DIR, "debug_audio")
 
 # ── Detector initialisation ───────────────────────────────────────────────────
 if os.path.exists(YUNET_PATH) and hasattr(cv2, "FaceDetectorYN"):

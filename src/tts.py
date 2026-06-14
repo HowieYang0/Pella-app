@@ -25,6 +25,7 @@ from queue import Empty
 
 from pydub import AudioSegment
 
+import stt
 from stt import TTS_MUTE_SEC, tts_mute_until
 
 
@@ -375,6 +376,10 @@ async def speak(text: str, audiohub, cache: dict):
             # the deadline to the post-return clock removes the ~200 ms
             # we were previously burning from the budget.
             tts_mute_until[0] = time.monotonic() + mute_dur
+            # Record what just started playing so the ASR pipeline can
+            # filter echoes (transcripts that look like fragments of
+            # Pella s own speech leaking past the mute window).
+            stt.note_tts_play(text, entry.get("duration", 0.0))
             print(f"TTS {tag} playing {repr(preview)} "
                   f"(mute until +{mute_dur:.1f}s, "
                   f"play_by_uuid_call: {time.monotonic()-t0:.2f}s done)",
