@@ -144,16 +144,30 @@ def configure_debug_audio_dir(path):
         _debug_audio_dir[0] = None
 
 
-def _debug_save_wav(samples, sample_rate):
-    """Save a WAV when dumping is enabled. Returns the path or None."""
+def _debug_save_wav(samples, sample_rate, category="speech"):
+    """Save a WAV under <debug_dir>/<category>/<stamp>_<seq>.wav.
+
+    `category` is one of:
+      * "speech" — Whisper produced a transcript (real speech or echo)
+      * "noise"  — VAD triggered but Whisper rejected as no_speech
+    Splitting by category lets us scan one subdir for the utterance we
+    want, and compare against samples in the other subdir to assess
+    background-vs-voice SNR.
+    """
     if _debug_audio_dir[0] is None:
         return None
     import wave
     from datetime import datetime
+    subdir = os.path.join(_debug_audio_dir[0], category)
+    try:
+        os.makedirs(subdir, exist_ok=True)
+    except Exception as e:
+        print(f"Debug audio: mkdir {subdir} failed: {e}", flush=True)
+        return None
     _debug_audio_counter[0] += 1
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base  = f"{stamp}_{_debug_audio_counter[0]:04d}"
-    path  = os.path.join(_debug_audio_dir[0], base + ".wav")
+    path  = os.path.join(subdir, base + ".wav")
     try:
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
@@ -502,16 +516,19 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
             else:
                 print("ASR: no speech detected in clip", flush=True)
 
-            # Only persist clips Whisper transcribed (real speech OR an
-            # echo we filtered). Drop "no speech detected" and stale
-            # clips so the dump stays small and easy to grep.
-            if text:
-                wav_path = _debug_save_wav(samples, USB_MIC_SAMPLE_RATE)
-                _debug_save_txt(
-                    wav_path, clip_sec, speech_start_t,
-                    transcript=text,
-                    reason=("echo" if echo else None),
-                )
+            # Save EVERY clip — but route by Whisper outcome so the user
+            # can scan one subdir for utterances and the other for
+            # background-noise samples without one drowning the other.
+            #   speech/  — Whisper transcribed text (real speech or echo)
+            #   noise/   — VAD triggered but Whisper rejected as silence
+            category = "speech" if text else "noise"
+            wav_path = _debug_save_wav(
+                samples, USB_MIC_SAMPLE_RATE, category=category)
+            _debug_save_txt(
+                wav_path, clip_sec, speech_start_t,
+                transcript=text or "",
+                reason=("echo" if echo else None),
+            )
 
         asr_executor.submit(_run)
 
