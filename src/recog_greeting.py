@@ -40,7 +40,6 @@ import numpy as np
 
 import actions
 import face_recognizer
-import stt
 from vision import (
     FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, SEE_COMPLAINT_COOLDOWN,
@@ -580,10 +579,6 @@ class RecogGreetingTask:
                     "Sorry, I didn't catch your name.")
             except Exception:
                 pass
-            # Capture the next 15 s of mic clips for diagnostic review —
-            # covers the apology TTS + the listening retry window.
-            stt.arm_debug_audio_window(
-                15.0, context="Sorry, I didn't catch your name.")
             self._enroll_state["attempts"] = attempts + 1
             self._enroll_state["asked_at"] = now
             print(f"Task[recog_greeting]: {reason} — apologising "
@@ -837,8 +832,6 @@ class RecogGreetingTask:
         except Exception as e:
             print(f"Task[recog_greeting]: WARN say_queue full, "
                   f"confirmation not queued: {e}", flush=True)
-        stt.arm_debug_audio_window(
-            15.0, context=f"Did you say {display_name}?")
         # Stale stitch buffer would otherwise glue onto the yes/no reply.
         self._enroll_pending = {"text": None, "speech_end_t": 0.0,
                                 "expires_at": 0.0}
@@ -1484,8 +1477,6 @@ class RecogGreetingTask:
         except Exception as e:
             print(f"Task[recog_greeting]: WARN say_queue full, "
                   f"name-ask not queued: {e}", flush=True)
-        stt.arm_debug_audio_window(
-            15.0, context="Hello, I am Pella. What is your name?")
         self._queue_recovery(now, after_tts=True)
         # Seed the candidate buffer with the recognition-phase best face
         # (the one that triggered introducing). More candidates accumulate

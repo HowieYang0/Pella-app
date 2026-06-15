@@ -114,59 +114,45 @@ tts_mute_until = [0.0]
 
 # ── Diagnostic audio-clip dump ────────────────────────────────────────────────
 #
-# When enabled, every clip that flushes during an armed window is saved as
-# <timestamp>.wav with a sidecar <timestamp>.txt listing the context (what
-# TTS armed the window), the clip duration, the age-when-sent, and Whisper s
-# transcript. The point is to listen back when Pella doesn t catch a reply
-# and decide whether the audio actually contained recognisable speech or
-# was genuinely empty / too quiet / too noisy.
+# When enabled (via configure_debug_audio_dir), EVERY clip that VAD flushes
+# is saved as <timestamp>_<seq>.wav with a sidecar <timestamp>_<seq>.txt
+# listing the most-recent TTS (conversational context), the clip duration,
+# the age-when-sent, Whisper s transcript, and any flag ("stale" / "echo").
+# Independent of the Q-A state machine — turning it on at startup is enough.
 #
-# Lifecycle:
-#   pella_main: stt.configure_debug_audio_dir("…/data/debug_audio")  at startup
-#   recog_greeting: stt.arm_debug_audio_window(15, context="…")  after each
-#       enrollment TTS so the listening window is captured.
+# The point is to listen back when Pella doesn t catch an utterance and
+# decide whether the audio actually contained recognisable speech or was
+# genuinely empty / too quiet / too noisy. Disk usage grows with use; clean
+# the directory periodically.
 _debug_audio_dir = [None]
-_debug_audio_state = {
-    "until":   0.0,    # monotonic deadline; older = window closed
-    "context": "",     # what TTS armed the window; written to the sidecar
-    "counter": 0,      # filename serial within the process
-}
+_debug_audio_counter = [0]
 
 
 def configure_debug_audio_dir(path):
     """Enable (or disable) diagnostic clip dumping.
 
     Pass a directory path to enable; pass None or "" to disable. The
-    directory is created if missing. Until arm_debug_audio_window() opens
-    a window, no clips are saved even when enabled.
+    directory is created if missing. Once enabled, every VAD-flushed clip
+    is saved — no further opt-in required.
     """
     if path:
         os.makedirs(path, exist_ok=True)
         _debug_audio_dir[0] = path
-        print(f"Debug audio: enabled, saving to {path}", flush=True)
+        print(f"Debug audio: enabled, saving every clip to {path}",
+              flush=True)
     else:
         _debug_audio_dir[0] = None
 
 
-def arm_debug_audio_window(duration_sec, context=""):
-    """Open a window during which captured clips get saved alongside their
-    transcripts. Re-arming extends the deadline.
-    """
-    _debug_audio_state["until"]   = time.monotonic() + duration_sec
-    _debug_audio_state["context"] = context
-
-
 def _debug_save_wav(samples, sample_rate):
-    """Save a WAV if armed + enabled. Returns the path or None."""
+    """Save a WAV when dumping is enabled. Returns the path or None."""
     if _debug_audio_dir[0] is None:
-        return None
-    if time.monotonic() >= _debug_audio_state["until"]:
         return None
     import wave
     from datetime import datetime
-    _debug_audio_state["counter"] += 1
+    _debug_audio_counter[0] += 1
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base  = f"{stamp}_{_debug_audio_state['counter']:04d}"
+    base  = f"{stamp}_{_debug_audio_counter[0]:04d}"
     path  = os.path.join(_debug_audio_dir[0], base + ".wav")
     try:
         with wave.open(path, "wb") as w:
@@ -180,19 +166,30 @@ def _debug_save_wav(samples, sample_rate):
         return None
 
 
-def _debug_save_txt(wav_path, context, clip_sec, speech_start_t,
+def _debug_save_txt(wav_path, clip_sec, speech_start_t,
                     transcript=None, reason=None):
-    """Sidecar metadata next to a dumped WAV — context + transcript so we
-    can review which question this audio was supposed to be answering."""
+    """Sidecar metadata next to a dumped WAV.
+
+    Context (the most recent TTS Pella said) is pulled from _recent_tts —
+    same source the echo filter uses — so the saved metadata always
+    reflects "what conversational state was Pella in" when this clip
+    arrived, without needing the caller to thread the context through.
+    """
     if not wav_path:
         return
     txt_path = wav_path[:-4] + ".txt"
+    now = time.monotonic()
+    # Only treat a TTS as "recent context" if it was playing within the
+    # last 10 s — otherwise this clip likely has nothing to do with it.
+    recent_context = ""
+    if _recent_tts["text"] and now - _recent_tts["ends_at"] < 10.0:
+        recent_context = _recent_tts["text"]
     try:
         with open(txt_path, "w") as f:
-            f.write(f"context: {context}\n")
+            f.write(f"recent_tts: {recent_context}\n")
             f.write(f"clip_sec: {clip_sec:.2f}\n")
             f.write(f"age_when_sent_sec: "
-                    f"{time.monotonic() - speech_start_t:.2f}\n")
+                    f"{now - speech_start_t:.2f}\n")
             f.write(f"transcript: "
                     f"{transcript if transcript else '<no speech detected>'}\n")
             if reason:
@@ -477,12 +474,11 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
               f"(speech started {time.monotonic() - speech_start_t:.1f}s ago)",
               flush=True)
 
-        # Save WAV for diagnostic review if we re inside an armed window.
-        # The sidecar .txt is written from _run() once Whisper returns, so
-        # the file pairs the audio with the transcript and "stale"/"echo"
-        # flagging.
+        # Save the WAV unconditionally if debug-audio is enabled. The
+        # sidecar .txt is written from _run() once Whisper returns so
+        # each saved clip is paired with its transcript and "stale" /
+        # "echo" flagging.
         debug_wav_path = _debug_save_wav(samples, USB_MIC_SAMPLE_RATE)
-        debug_context  = _debug_audio_state["context"] if debug_wav_path else ""
 
         def _run():
             # Drop stale clips: with max_workers=1 the executor serialises,
@@ -495,8 +491,8 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                 print(f"ASR: skipping stale {clip_sec:.1f}s clip "
                       f"({age:.1f}s old, > {MAX_CLIP_AGE_SEC:.0f}s cutoff)",
                       flush=True)
-                _debug_save_txt(debug_wav_path, debug_context, clip_sec,
-                                speech_start_t, transcript=None, reason="stale")
+                _debug_save_txt(debug_wav_path, clip_sec, speech_start_t,
+                                transcript=None, reason="stale")
                 return
             text = transcribe(samples, src_sr=USB_MIC_SAMPLE_RATE,
                               nr_prop=USB_NR_PROP_DECREASE)
@@ -514,7 +510,7 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
             else:
                 print("ASR: no speech detected in clip", flush=True)
             _debug_save_txt(
-                debug_wav_path, debug_context, clip_sec, speech_start_t,
+                debug_wav_path, clip_sec, speech_start_t,
                 transcript=text or "",
                 reason=("echo" if echo else None),
             )
