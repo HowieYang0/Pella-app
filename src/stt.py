@@ -474,12 +474,6 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
               f"(speech started {time.monotonic() - speech_start_t:.1f}s ago)",
               flush=True)
 
-        # Save the WAV unconditionally if debug-audio is enabled. The
-        # sidecar .txt is written from _run() once Whisper returns so
-        # each saved clip is paired with its transcript and "stale" /
-        # "echo" flagging.
-        debug_wav_path = _debug_save_wav(samples, USB_MIC_SAMPLE_RATE)
-
         def _run():
             # Drop stale clips: with max_workers=1 the executor serialises,
             # and on a CPU-only Jetson a 6 s burst of speech can sit ~10 s
@@ -491,8 +485,6 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                 print(f"ASR: skipping stale {clip_sec:.1f}s clip "
                       f"({age:.1f}s old, > {MAX_CLIP_AGE_SEC:.0f}s cutoff)",
                       flush=True)
-                _debug_save_txt(debug_wav_path, clip_sec, speech_start_t,
-                                transcript=None, reason="stale")
                 return
             text = transcribe(samples, src_sr=USB_MIC_SAMPLE_RATE,
                               nr_prop=USB_NR_PROP_DECREASE)
@@ -509,11 +501,17 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                       f"{_recent_tts['text']!r}: {text!r}", flush=True)
             else:
                 print("ASR: no speech detected in clip", flush=True)
-            _debug_save_txt(
-                debug_wav_path, clip_sec, speech_start_t,
-                transcript=text or "",
-                reason=("echo" if echo else None),
-            )
+
+            # Only persist clips Whisper transcribed (real speech OR an
+            # echo we filtered). Drop "no speech detected" and stale
+            # clips so the dump stays small and easy to grep.
+            if text:
+                wav_path = _debug_save_wav(samples, USB_MIC_SAMPLE_RATE)
+                _debug_save_txt(
+                    wav_path, clip_sec, speech_start_t,
+                    transcript=text,
+                    reason=("echo" if echo else None),
+                )
 
         asr_executor.submit(_run)
 
