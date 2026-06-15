@@ -38,3 +38,9 @@ data/face_ids/
 # enrollment listening windows. Same PII concern as face_ids/ — keep
 # local, review on the dock, clean up periodically.
 data/debug_audio/
+
+# Per-dock noise profile captured at startup by stt.ensure_noise_profile().
+# Each dock has its own ambient acoustic signature (fan, room hum, AC) so
+# this file shouldn t be shared. Delete it to force a fresh capture (e.g.
+# after moving the dock to a new room).
+data/noise_profile.wav
