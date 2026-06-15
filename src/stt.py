@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from queue import Queue, Empty
+from typing import Optional
 
 import numpy as np
 import soxr
@@ -151,7 +152,8 @@ def configure_debug_audio_dir(path):
         _debug_audio_dir[0] = None
 
 
-def _debug_save_wav(samples, sample_rate, category="speech"):
+def _debug_save_wav(samples, sample_rate, category="speech",
+                    filtered_float=None):
     """Save a WAV under <debug_dir>/<category>/<stamp>_<seq>.wav.
 
     `category` is one of:
@@ -160,6 +162,13 @@ def _debug_save_wav(samples, sample_rate, category="speech"):
     Splitting by category lets us scan one subdir for the utterance we
     want, and compare against samples in the other subdir to assess
     background-vs-voice SNR.
+
+    `filtered_float` is the post-pre-processing float32 array (high-pass +
+    noisereduce output) — what Whisper actually saw. When provided, it s
+    written next to the raw WAV as <stamp>_<seq>_filtered.wav so we can
+    A/B compare what the filter did to a given utterance.
+
+    Returns the raw WAV path (or None on failure).
     """
     if _debug_audio_dir[0] is None:
         return None
@@ -181,10 +190,26 @@ def _debug_save_wav(samples, sample_rate, category="speech"):
             w.setsampwidth(2)
             w.setframerate(sample_rate)
             w.writeframes(samples.tobytes())
-        return path
     except Exception as e:
         print(f"Debug audio: WAV save failed: {e}", flush=True)
         return None
+
+    # Companion file with the post-filter audio so you can compare
+    # before/after for the same utterance.
+    if filtered_float is not None:
+        filt_path = os.path.join(subdir, base + "_filtered.wav")
+        try:
+            int16 = np.clip(filtered_float * 32768.0,
+                            -32768, 32767).astype(np.int16)
+            with wave.open(filt_path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes(int16.tobytes())
+        except Exception as e:
+            print(f"Debug audio: filtered WAV save failed: {e}", flush=True)
+
+    return path
 
 
 def _debug_save_txt(wav_path, clip_sec, speech_start_t,
@@ -426,11 +451,16 @@ def ensure_noise_profile(read_chunk_fn, sample_rate: int) -> None:
 
 def transcribe(samples: np.ndarray,
                src_sr: int = ROBOT_SAMPLE_RATE,
-               nr_prop: float = 0.75) -> str:
+               nr_prop: float = 0.75,
+               *, out_filtered: Optional[list] = None) -> str:
     """Convert mono int16 audio to text via Whisper.
 
     Resamples to 16 kHz if needed, applies optional noise reduction,
     then runs Whisper. Returns empty string when no speech is detected.
+
+    out_filtered: optional list. When provided, the post-filter float32
+    audio array (what Whisper actually saw) is appended to it so the
+    caller can persist it for A/B comparison alongside the raw input.
     """
     try:
         audio_f = samples.astype(np.float32) / 32768.0
@@ -457,6 +487,15 @@ def transcribe(samples: np.ndarray,
                 if _noise_profile is not None:
                     kwargs["y_noise"] = _noise_profile
                 audio_16k = _nr.reduce_noise(y=audio_16k, **kwargs)
+            except Exception:
+                pass
+
+        # Hand the post-filter audio back to the caller so it can save a
+        # "_filtered" companion WAV next to the raw dump. Copy to avoid
+        # later in-place mutations by Whisper backends.
+        if out_filtered is not None:
+            try:
+                out_filtered.append(np.asarray(audio_16k, dtype=np.float32).copy())
             except Exception:
                 pass
 
@@ -638,8 +677,14 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                       f"({age:.1f}s old, > {MAX_CLIP_AGE_SEC:.0f}s cutoff)",
                       flush=True)
                 return
+            # Capture the post-filter audio so we can save it next to the
+            # raw input for A/B review. transcribe() appends the float32
+            # array; we convert to int16 inside _debug_save_wav.
+            filtered_holder = []
             text = transcribe(samples, src_sr=USB_MIC_SAMPLE_RATE,
-                              nr_prop=USB_NR_PROP_DECREASE)
+                              nr_prop=USB_NR_PROP_DECREASE,
+                              out_filtered=filtered_holder)
+            filtered_audio = filtered_holder[0] if filtered_holder else None
             echo = bool(text) and _is_echo(text, speech_start_t)
             if text and not echo:
                 print(f"Heard: {text}", flush=True)
@@ -659,9 +704,13 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
             # background-noise samples without one drowning the other.
             #   speech/  — Whisper transcribed text (real speech or echo)
             #   noise/   — VAD triggered but Whisper rejected as silence
+            # Each raw <stamp>_<seq>.wav gets a companion
+            # <stamp>_<seq>_filtered.wav so we can A/B compare the
+            # pre-processing step on any captured utterance.
             category = "speech" if text else "noise"
             wav_path = _debug_save_wav(
-                samples, USB_MIC_SAMPLE_RATE, category=category)
+                samples, USB_MIC_SAMPLE_RATE, category=category,
+                filtered_float=filtered_audio)
             _debug_save_txt(
                 wav_path, clip_sec, speech_start_t,
                 transcript=text or "",
