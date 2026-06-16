@@ -412,6 +412,15 @@ DECLICK_THRESHOLD_FACTOR = 4.5     # 4.0 -> 4.5: real captures showed
                                    # zero false positives already; bumping
                                    # slightly higher reserves de-click for
                                    # only the most unambiguous impulses.
+
+# Loudness normalization targets applied AFTER high-pass + noisereduce.
+# Pick values close to Whisper s training distribution so its VAD filter
+# and no_speech_prob calibration stay sane. Real captures landed around
+# -41 to -45 dBFS RMS pre-normalize; these targets boost ~16-22 dB.
+NORMALIZE_TARGET_RMS = 0.05        # ~-26 dBFS — typical speech level
+NORMALIZE_PEAK_CEIL  = 0.70        # ~-3 dBFS — hard ceiling so we never
+                                   # clip even when target_rms would
+                                   # require a much higher gain.
 DECLICK_MAX_WIDTH        = 16     # 1 ms @ 16 kHz: opposite-sign jump
                                   # must arrive within this window for the
                                   # candidate to count as an impulse.
@@ -629,6 +638,26 @@ def transcribe(samples: np.ndarray,
             except Exception:
                 pass
 
+        # 4. Loudness normalization. The high-pass + noisereduce stages
+        #    typically leave voice content very quiet (real-world clips
+        #    measure RMS around -41 to -45 dBFS, ~20 dB below typical
+        #    speech). Whisper s log-mel features are technically
+        #    log-scale-invariant, but its built-in VAD and no_speech_prob
+        #    behave noticeably better with input at training-corpus levels
+        #    (~-23 dBFS RMS). Boost to a target RMS, capped by a safe peak
+        #    so we never clip into distortion.
+        try:
+            peak = float(np.abs(audio_16k).max())
+            if peak > 1e-6:
+                rms = float(np.sqrt(np.mean(audio_16k ** 2)))
+                if rms > 1e-6:
+                    gain_rms  = NORMALIZE_TARGET_RMS  / rms
+                    gain_peak = NORMALIZE_PEAK_CEIL   / peak
+                    gain = min(gain_rms, gain_peak)
+                    audio_16k = (audio_16k * gain).astype(np.float32)
+        except Exception:
+            pass
+
         # Hand the post-filter audio back to the caller so it can save a
         # "_filtered" companion WAV next to the raw dump. Copy to avoid
         # later in-place mutations by Whisper backends.
@@ -643,6 +672,17 @@ def transcribe(samples: np.ndarray,
                 audio_16k, language="en", beam_size=5,
                 vad_filter=True, condition_on_previous_text=False,
                 no_speech_threshold=NO_SPEECH_THRESHOLD,
+                # Whisper s built-in hallucination guards. Tightened from
+                # defaults (2.4 / -1.0) because real captures showed the
+                # language model inventing plausible English ("Peace be
+                # upon you.", "William, Pella.") for clips with only a
+                # fraction of a second of actual voice. Stricter values
+                # cause Whisper to reject low-confidence decodes upfront
+                # instead of committing to them.
+                compression_ratio_threshold=2.0,   # repetitive / templated
+                                                   # decodes get rejected
+                log_prob_threshold=-0.7,           # low-confidence decodes
+                                                   # get rejected
                 # Language-model hint that biases Whisper toward the name-
                 # introduction patterns we actually listen for, away from
                 # frequent-English hallucinations ("It's Alison" / "Hey
