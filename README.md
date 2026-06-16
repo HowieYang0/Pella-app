@@ -7,7 +7,12 @@ respond to short spoken interactions — all over the Go2's WebRTC channel.
 
 ## Demo
 
-[▶ Watch the intro video](data/intro.mp4)
+<!--
+Inline-embed the intro video here. Upload data/intro.mp4 once via a draft
+issue on GitHub (drag-and-drop into the comment box), copy the
+user-attachments URL GitHub returns, and paste it on its own line below.
+GitHub renders a bare attachment URL as an inline video player.
+-->
 
 ## Architecture
 
