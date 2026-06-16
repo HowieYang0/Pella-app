@@ -103,7 +103,12 @@ USB_NOISE_FLOOR_FACTOR = 1.2     # RMS entry threshold; speech at 3ft peaks well
 USB_SILENCE_HOLD_FACTOR = 1.8   # hysteresis: only resets silence counter for strong speech
 USB_SPIKE_REJECT       = 8       # skip frames above this × floor (LiDAR impacts, physical contact)
 USB_WARMUP_FRAMES      = 100     # ~2 s fast-adapt then normal EMA
-USB_NR_PROP_DECREASE   = 0.85    # aggressive NR — LiDAR/fan noise is very stationary
+USB_NR_PROP_DECREASE   = 0.75    # 0.85 -> 0.75 after real captures showed
+                                 # voice harmonics were being over-subtracted
+                                 # (filtered output sounded slightly hollow).
+                                 # 0.75 preserves more of the voice signal
+                                 # while still removing the bulk of the
+                                 # stationary fan / LiDAR / hum noise.
 USB_VAD_SPEECH_FRAMES  = 2       # consecutive frames needed to enter speech mode (40 ms)
                                  # Lowered from 3 → 2 with new mic bracket so a
                                  # brief vowel onset enters speech mode faster.
@@ -364,7 +369,14 @@ if _HAS_NR:
 #      entirely voice — the old per-clip estimation otherwise included
 #      voice harmonics and subtracted them from themselves.
 HIGHPASS_CUTOFF_HZ   = 250
-HIGHPASS_ORDER       = 8
+HIGHPASS_ORDER       = 6     # Lowered from 8 -> 6 after the first round of
+                             # real captures sounded over-processed in the
+                             # 200-300 Hz range. At 6th order the corner is
+                             # almost as sharp (36 dB/oct vs 48 dB/oct) so
+                             # noise rejection drops only a little (<200Hz
+                             # band: 2 % -> 8 % of total energy) while the
+                             # voice tail above the cutoff is attenuated
+                             # less steeply — voice sounds more natural.
 _HP_SOS = (butter(HIGHPASS_ORDER, HIGHPASS_CUTOFF_HZ, btype="highpass",
                   fs=ASR_SAMPLE_RATE, output="sos")
            if _HAS_SCIPY else None)
@@ -396,7 +408,10 @@ if _HP_SOS is not None:
 # Repair: replace ±DECLICK_PAD_SAMPLES around the impulse with a linear
 #   interpolation between the boundary samples just outside the patched
 #   region.
-DECLICK_THRESHOLD_FACTOR = 4.0
+DECLICK_THRESHOLD_FACTOR = 4.5     # 4.0 -> 4.5: real captures showed
+                                   # zero false positives already; bumping
+                                   # slightly higher reserves de-click for
+                                   # only the most unambiguous impulses.
 DECLICK_MAX_WIDTH        = 16     # 1 ms @ 16 kHz: opposite-sign jump
                                   # must arrive within this window for the
                                   # candidate to count as an impulse.
