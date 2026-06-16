@@ -153,20 +153,17 @@ def configure_debug_audio_dir(path):
 
 
 def _debug_save_wav(samples, sample_rate, category="speech",
-                    filtered_float=None):
-    """Save a WAV under <debug_dir>/<category>/<stamp>_<seq>.wav.
+                    declicked_float=None, filtered_float=None):
+    """Save a WAV under <debug_dir>/<category>/<stamp>_<seq>.wav, plus
+    optional companion files for each stage of the pre-processing pipeline:
+      * <stamp>_<seq>.wav            — raw (input to declick)
+      * <stamp>_<seq>_declicked.wav  — after declick, pre HP + NR
+      * <stamp>_<seq>_filtered.wav   — after full pipeline (what Whisper saw)
+    Compare any two in Audacity to isolate the effect of one stage.
 
-    `category` is one of:
+    `category` routes by Whisper outcome:
       * "speech" — Whisper produced a transcript (real speech or echo)
       * "noise"  — VAD triggered but Whisper rejected as no_speech
-    Splitting by category lets us scan one subdir for the utterance we
-    want, and compare against samples in the other subdir to assess
-    background-vs-voice SNR.
-
-    `filtered_float` is the post-pre-processing float32 array (high-pass +
-    noisereduce output) — what Whisper actually saw. When provided, it s
-    written next to the raw WAV as <stamp>_<seq>_filtered.wav so we can
-    A/B compare what the filter did to a given utterance.
 
     Returns the raw WAV path (or None on failure).
     """
@@ -194,21 +191,24 @@ def _debug_save_wav(samples, sample_rate, category="speech",
         print(f"Debug audio: WAV save failed: {e}", flush=True)
         return None
 
-    # Companion file with the post-filter audio so you can compare
-    # before/after for the same utterance.
-    if filtered_float is not None:
-        filt_path = os.path.join(subdir, base + "_filtered.wav")
+    def _save_companion(suffix, float_arr):
+        if float_arr is None:
+            return
+        comp_path = os.path.join(subdir, base + suffix)
         try:
-            int16 = np.clip(filtered_float * 32768.0,
+            int16 = np.clip(float_arr * 32768.0,
                             -32768, 32767).astype(np.int16)
-            with wave.open(filt_path, "wb") as w:
+            with wave.open(comp_path, "wb") as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(sample_rate)
                 w.writeframes(int16.tobytes())
         except Exception as e:
-            print(f"Debug audio: filtered WAV save failed: {e}", flush=True)
+            print(f"Debug audio: companion WAV save failed "
+                  f"({suffix}): {e}", flush=True)
 
+    _save_companion("_declicked.wav", declicked_float)
+    _save_companion("_filtered.wav",  filtered_float)
     return path
 
 
@@ -373,6 +373,71 @@ if _HP_SOS is not None:
           f"(order {HIGHPASS_ORDER}, {HIGHPASS_CUTOFF_HZ} Hz cutoff)",
           flush=True)
 
+
+# ── De-clicker ────────────────────────────────────────────────────────────────
+#
+# Impulsive transients ("explosive clicks") show up in the dock capture from
+# USB packet hiccups, LiDAR motor pulses leaking into the mic body, or
+# mechanical taps on the surface. They are very brief (~1-5 ms), broadband,
+# and produce sample-to-sample jumps far larger than anything in speech.
+# Whisper is sensitive to them: a click in the middle of "Joy" easily
+# becomes a different acoustic token in the encoder.
+#
+# Detection: sample-to-sample |diff| > DECLICK_THRESHOLD_FACTOR * clip_rms.
+#   Calibrated on real captures: speech jumps stay below 0.5x RMS even at
+#   the 99.9th percentile, while audible clicks register at 2.5-5x. The
+#   gap is wide enough that a 3x threshold catches every click without
+#   touching speech onsets — hard consonants (/p/, /t/, /k/) produce
+#   smooth (band-limited) attacks that don t hit this threshold.
+# Repair: replace a ±DECLICK_WINDOW_SAMPLES window around each detected
+#   spike with a linear interpolation between the boundary samples. At
+#   16 kHz, 32 samples = 2 ms — enough to span a typical click without
+#   eating any speech content.
+DECLICK_THRESHOLD_FACTOR = 3.0
+DECLICK_WINDOW_SAMPLES   = 32     # ±2 ms @ 16 kHz
+
+
+def _declick(audio: np.ndarray) -> np.ndarray:
+    """Detect impulsive clicks and replace them with linear interpolation.
+
+    Operates on a float32 array sampled at ASR_SAMPLE_RATE. Returns a
+    new array (input unmodified). Safe to call even when no clicks are
+    present — the worst case is a few CPU microseconds and no-op output.
+    """
+    if audio.size < 3:
+        return audio
+    rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+    if rms <= 0:
+        return audio
+    threshold = DECLICK_THRESHOLD_FACTOR * rms
+    diff = np.abs(np.diff(audio))
+    # Indices of samples whose forward jump exceeds the threshold. We
+    # patch around each spike, then merge any overlapping windows.
+    spikes = np.flatnonzero(diff > threshold)
+    if spikes.size == 0:
+        return audio
+    out  = audio.copy()
+    n    = out.size
+    half = DECLICK_WINDOW_SAMPLES
+    # Build interval list, coalesce overlapping/adjacent ones.
+    intervals = []
+    for idx in spikes:
+        lo = max(0, int(idx) - half)
+        hi = min(n - 1, int(idx) + half)
+        if intervals and lo <= intervals[-1][1] + 1:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], hi))
+        else:
+            intervals.append((lo, hi))
+    for lo, hi in intervals:
+        if lo <= 0 or hi >= n - 1:
+            # Spike at boundary — clamp to nearest in-range value.
+            edge = out[hi + 1] if hi < n - 1 else out[lo - 1] if lo > 0 else 0.0
+            out[lo:hi + 1] = edge
+        else:
+            out[lo:hi + 1] = np.linspace(out[lo - 1], out[hi + 1],
+                                         hi - lo + 1, dtype=out.dtype)
+    return out
+
 _NOISE_PROFILE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..", "data", "noise_profile.wav",
@@ -452,22 +517,44 @@ def ensure_noise_profile(read_chunk_fn, sample_rate: int) -> None:
 def transcribe(samples: np.ndarray,
                src_sr: int = ROBOT_SAMPLE_RATE,
                nr_prop: float = 0.75,
-               *, out_filtered: Optional[list] = None) -> str:
+               *,
+               out_declicked: Optional[list] = None,
+               out_filtered:  Optional[list] = None) -> str:
     """Convert mono int16 audio to text via Whisper.
 
-    Resamples to 16 kHz if needed, applies optional noise reduction,
-    then runs Whisper. Returns empty string when no speech is detected.
+    Resamples to 16 kHz if needed, runs the three-stage preprocessing
+    pipeline (declick -> high-pass -> noisereduce), then runs Whisper.
+    Returns empty string when no speech is detected.
 
-    out_filtered: optional list. When provided, the post-filter float32
-    audio array (what Whisper actually saw) is appended to it so the
-    caller can persist it for A/B comparison alongside the raw input.
+    out_declicked / out_filtered: optional lists for A/B diagnostics.
+    When provided, intermediate float32 audio is appended to each:
+      * out_declicked — after declick only (pre HP + NR)
+      * out_filtered  — after the full pipeline (what Whisper saw)
+    The caller can persist these as companion WAVs to compare the
+    individual stages in Audacity.
     """
     try:
         audio_f = samples.astype(np.float32) / 32768.0
         audio_16k = audio_f if src_sr == ASR_SAMPLE_RATE else \
                     soxr.resample(audio_f, src_sr, ASR_SAMPLE_RATE, quality="HQ")
 
-        # 1. High-pass: kill the 0-150 Hz band where >96 % of the dock s
+        # 1. De-click: replace impulsive transients with linear
+        #    interpolation. Runs first so the downstream filters see
+        #    a clean signal — clicks otherwise smear through the
+        #    high-pass / noisereduce stages and end up as residual
+        #    ringing that Whisper still hears.
+        try:
+            audio_16k = _declick(audio_16k)
+        except Exception:
+            pass
+        if out_declicked is not None:
+            try:
+                out_declicked.append(
+                    np.asarray(audio_16k, dtype=np.float32).copy())
+            except Exception:
+                pass
+
+        # 2. High-pass: kill the 0-150 Hz band where >96 % of the dock s
         #    background noise lives (mains harmonics + fan rumble). Voice
         #    energy starts ~200 Hz, so the speech band is untouched.
         if _HP_SOS is not None:
@@ -476,7 +563,7 @@ def transcribe(samples: np.ndarray,
             except Exception:
                 pass
 
-        # 2. Spectral noise reduction. Use the pre-captured profile if we
+        # 3. Spectral noise reduction. Use the pre-captured profile if we
         #    have one — surgical subtraction of the actual ambient.
         #    Otherwise fall back to per-clip estimation (noisier, but
         #    still better than nothing).
@@ -677,14 +764,18 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                       f"({age:.1f}s old, > {MAX_CLIP_AGE_SEC:.0f}s cutoff)",
                       flush=True)
                 return
-            # Capture the post-filter audio so we can save it next to the
-            # raw input for A/B review. transcribe() appends the float32
-            # array; we convert to int16 inside _debug_save_wav.
-            filtered_holder = []
+            # Capture intermediate stages for A/B review. transcribe()
+            # appends float32 arrays; we convert to int16 inside
+            # _debug_save_wav. Two stages: post-declick (pre HP+NR) and
+            # post-full-pipeline (what Whisper actually saw).
+            declicked_holder = []
+            filtered_holder  = []
             text = transcribe(samples, src_sr=USB_MIC_SAMPLE_RATE,
                               nr_prop=USB_NR_PROP_DECREASE,
+                              out_declicked=declicked_holder,
                               out_filtered=filtered_holder)
-            filtered_audio = filtered_holder[0] if filtered_holder else None
+            declicked_audio = declicked_holder[0] if declicked_holder else None
+            filtered_audio  = filtered_holder[0]  if filtered_holder  else None
             echo = bool(text) and _is_echo(text, speech_start_t)
             if text and not echo:
                 print(f"Heard: {text}", flush=True)
@@ -704,12 +795,14 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
             # background-noise samples without one drowning the other.
             #   speech/  — Whisper transcribed text (real speech or echo)
             #   noise/   — VAD triggered but Whisper rejected as silence
-            # Each raw <stamp>_<seq>.wav gets a companion
-            # <stamp>_<seq>_filtered.wav so we can A/B compare the
-            # pre-processing step on any captured utterance.
+            # Each raw <stamp>_<seq>.wav gets two companions:
+            #   _declicked.wav — after declick only
+            #   _filtered.wav  — after declick + HP + noisereduce
+            # so we can A/B compare each preprocessing stage in Audacity.
             category = "speech" if text else "noise"
             wav_path = _debug_save_wav(
                 samples, USB_MIC_SAMPLE_RATE, category=category,
+                declicked_float=declicked_audio,
                 filtered_float=filtered_audio)
             _debug_save_txt(
                 wav_path, clip_sec, speech_start_t,
