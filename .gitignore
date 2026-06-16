@@ -39,6 +39,10 @@ data/face_ids/
 # local, review on the dock, clean up periodically.
 data/debug_audio/
 
+# Ad-hoc recorded utterances used during STT debugging sessions (manual
+# scp'd from the dock for review in Audacity). Voice content — keep local.
+data/audio/
+
 # Per-dock noise profile captured at startup by stt.ensure_noise_profile().
 # Each dock has its own ambient acoustic signature (fan, room hum, AC) so
 # this file shouldn t be shared. Delete it to force a fresh capture (e.g.
