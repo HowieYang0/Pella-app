@@ -5,6 +5,12 @@ the robot's front camera and an external USB microphone to detect people,
 recognise faces it has seen before, learn the names of new people, and
 respond to short spoken interactions — all over the Go2's WebRTC channel.
 
+## Demo
+
+[▶ Watch the intro video](data/intro.mp4)
+
+## Architecture
+
 ```
 +-------------------+
 |     pella_main    |   sense-respond brain; owns the WebRTC connection,
