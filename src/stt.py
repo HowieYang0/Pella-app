@@ -378,23 +378,31 @@ if _HP_SOS is not None:
 #
 # Impulsive transients ("explosive clicks") show up in the dock capture from
 # USB packet hiccups, LiDAR motor pulses leaking into the mic body, or
-# mechanical taps on the surface. They are very brief (~1-5 ms), broadband,
+# mechanical taps on the surface. They are very brief (~1-2 ms), broadband,
 # and produce sample-to-sample jumps far larger than anything in speech.
 # Whisper is sensitive to them: a click in the middle of "Joy" easily
 # becomes a different acoustic token in the encoder.
 #
-# Detection: sample-to-sample |diff| > DECLICK_THRESHOLD_FACTOR * clip_rms.
-#   Calibrated on real captures: speech jumps stay below 0.5x RMS even at
-#   the 99.9th percentile, while audible clicks register at 2.5-5x. The
-#   gap is wide enough that a 3x threshold catches every click without
-#   touching speech onsets — hard consonants (/p/, /t/, /k/) produce
-#   smooth (band-limited) attacks that don t hit this threshold.
-# Repair: replace a ±DECLICK_WINDOW_SAMPLES window around each detected
-#   spike with a linear interpolation between the boundary samples. At
-#   16 kHz, 32 samples = 2 ms — enough to span a typical click without
-#   eating any speech content.
-DECLICK_THRESHOLD_FACTOR = 3.0
-DECLICK_WINDOW_SAMPLES   = 32     # ±2 ms @ 16 kHz
+# Detection is two-stage to avoid clipping voiced consonants:
+#   1. Candidate spike: a sample-to-sample |diff| above
+#      DECLICK_THRESHOLD_FACTOR * clip_rms (4x by default).
+#   2. Narrow-impulse confirmation: within DECLICK_MAX_WIDTH samples
+#      after the candidate, there must be an opposite-sign jump of
+#      similar magnitude. That s the signature of a true impulse
+#      returning to baseline. Speech onsets (/p/, /t/, /k/, fricatives)
+#      attack hard then stay elevated for ~10-50 ms as formants
+#      resonate — they never produce the opposing-sign rebound and
+#      so are left alone.
+# Repair: replace ±DECLICK_PAD_SAMPLES around the impulse with a linear
+#   interpolation between the boundary samples just outside the patched
+#   region.
+DECLICK_THRESHOLD_FACTOR = 4.0
+DECLICK_MAX_WIDTH        = 16     # 1 ms @ 16 kHz: opposite-sign jump
+                                  # must arrive within this window for the
+                                  # candidate to count as an impulse.
+DECLICK_PAD_SAMPLES      = 8      # ±0.5 ms padding around each patched
+                                  # impulse; keeps interpolation away from
+                                  # the click s ringing tail.
 
 
 def _declick(audio: np.ndarray) -> np.ndarray:
@@ -403,6 +411,10 @@ def _declick(audio: np.ndarray) -> np.ndarray:
     Operates on a float32 array sampled at ASR_SAMPLE_RATE. Returns a
     new array (input unmodified). Safe to call even when no clicks are
     present — the worst case is a few CPU microseconds and no-op output.
+
+    Only patches *narrow* impulses (≤ DECLICK_MAX_WIDTH samples wide,
+    where width = distance to the matching opposite-sign jump).
+    Wide-but-loud transients like plosives or hand claps are preserved.
     """
     if audio.size < 3:
         return audio
@@ -410,28 +422,53 @@ def _declick(audio: np.ndarray) -> np.ndarray:
     if rms <= 0:
         return audio
     threshold = DECLICK_THRESHOLD_FACTOR * rms
-    diff = np.abs(np.diff(audio))
-    # Indices of samples whose forward jump exceeds the threshold. We
-    # patch around each spike, then merge any overlapping windows.
-    spikes = np.flatnonzero(diff > threshold)
-    if spikes.size == 0:
+    diff = np.diff(audio)
+    abs_diff = np.abs(diff)
+    candidates = np.flatnonzero(abs_diff > threshold)
+    if candidates.size == 0:
         return audio
-    out  = audio.copy()
-    n    = out.size
-    half = DECLICK_WINDOW_SAMPLES
-    # Build interval list, coalesce overlapping/adjacent ones.
+
+    n     = audio.size
+    pad   = DECLICK_PAD_SAMPLES
+    max_w = DECLICK_MAX_WIDTH
+    diff_len = diff.size
+
+    # For each candidate, look for an opposite-sign jump of similar
+    # magnitude within max_w samples ahead. If found, that confirms a
+    # narrow impulse; otherwise leave the candidate alone.
     intervals = []
-    for idx in spikes:
-        lo = max(0, int(idx) - half)
-        hi = min(n - 1, int(idx) + half)
+    last_patched = -1
+    for i in candidates:
+        if i <= last_patched:
+            continue        # already inside a previously-patched window
+        sign_i = diff[i]
+        # Search window: diff[i+1 .. i+max_w]
+        end = min(i + max_w + 1, diff_len)
+        if sign_i > 0:
+            opp = np.flatnonzero(diff[i + 1:end] < -threshold)
+        else:
+            opp = np.flatnonzero(diff[i + 1:end] > threshold)
+        if opp.size == 0:
+            continue        # no rebound — not an impulse (likely speech)
+        j = int(i + 1 + opp[0])     # index of the opposing jump in diff
+        # Patch span: from spike start to one sample past the rebound,
+        # padded on both sides so the interpolation reaches stable audio.
+        lo = max(0, int(i) - pad)
+        hi = min(n - 1, j + 1 + pad)
         if intervals and lo <= intervals[-1][1] + 1:
             intervals[-1] = (intervals[-1][0], max(intervals[-1][1], hi))
         else:
             intervals.append((lo, hi))
+        last_patched = hi
+
+    if not intervals:
+        return audio
+
+    out = audio.copy()
     for lo, hi in intervals:
         if lo <= 0 or hi >= n - 1:
-            # Spike at boundary — clamp to nearest in-range value.
-            edge = out[hi + 1] if hi < n - 1 else out[lo - 1] if lo > 0 else 0.0
+            edge = out[hi + 1] if hi < n - 1 \
+                   else (out[lo - 1] if lo > 0 else 0.0)
             out[lo:hi + 1] = edge
         else:
             out[lo:hi + 1] = np.linspace(out[lo - 1], out[hi + 1],
