@@ -32,7 +32,7 @@ from vision import (
     ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
     ENROLL_BRIGHT_LO, ENROLL_BRIGHT_HI, ENROLL_BRIGHT_MIN_STD,
     detect_faces, detect_motion, detect_person, is_face_at_edge,
-    sharpness, recognition_worker,
+    sharpness,
 )
 
 
@@ -129,6 +129,32 @@ def _enroll_candidate_relaxed_score(c: dict) -> float:
     yaw_offset = abs(lm[2][0] - eye_mid_x) / eye_width
     yaw_q      = max(0.0, 1.0 - yaw_offset / 0.3)
     return s * (0.5 + 0.5 * yaw_q)
+
+
+# ── Recognition worker thread target ───────────────────────────────────────
+
+def recognition_worker(recognizer, rec_in: Queue, rec_out: Queue,
+                        stop_event: threading.Event):
+    """Thread target: read (image, faces) pairs, write (faces, names) bundles.
+
+    Bundling faces with names keeps the consumer immune to index drift if
+    last_faces is updated by a newer detection while recognition is in
+    flight. Belongs here (not in vision.py) because it s the policy that
+    says "we run identity inference on a worker thread and drain the
+    results into a queue" — that s a perception concern, not a stateless
+    vision primitive.
+    """
+    while not stop_event.is_set():
+        try:
+            img, faces = rec_in.get(timeout=0.1)
+            names = []
+            for face in faces:
+                lm = face[4] if len(face) > 4 else None
+                name, _ = recognizer.recognize(img, lm)
+                names.append(name)
+            rec_out.put((faces, names))
+        except Empty:
+            continue
 
 
 # ── Perception class ────────────────────────────────────────────────────────

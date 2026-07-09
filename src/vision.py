@@ -2,8 +2,6 @@
 """Face detection and recognition pipeline."""
 
 import os
-import threading
-from queue import Queue, Empty
 
 import cv2
 import numpy as np
@@ -366,21 +364,3 @@ def load_recognizer():
         return None
 
 
-def recognition_worker(recognizer, rec_in: Queue, rec_out: Queue,
-                        stop_event: threading.Event):
-    """Thread target: read (image, faces) pairs, write (faces, names) bundles.
-
-    Bundling faces with names keeps the consumer immune to index drift if
-    last_faces is updated by a newer detection while recognition is in flight.
-    """
-    while not stop_event.is_set():
-        try:
-            img, faces = rec_in.get(timeout=0.1)
-            names = []
-            for face in faces:
-                lm = face[4] if len(face) > 4 else None
-                name, _ = recognizer.recognize(img, lm)
-                names.append(name)
-            rec_out.put((faces, names))
-        except Empty:
-            continue
