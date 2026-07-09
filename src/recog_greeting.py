@@ -29,28 +29,22 @@ transcripts via submit_transcript() and renders what the task asks.
 
 import os
 import re
-import threading
-from collections import Counter, deque
 from dataclasses import dataclass, field
-from queue import Queue, Empty
+from queue import Empty
 from typing import Optional
 
-import cv2
 import numpy as np
 
 import actions
-import face_recognizer
+from perception import Perception
 from vision import (
-    FACE_DETECT_EVERY, GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
+    GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, SEE_COMPLAINT_COOLDOWN,
     ENROLL_LISTEN_WINDOW, ENROLL_LOOKBACK_SEC,
     ENROLL_TIMEOUT, ENROLL_MAX_ATTEMPTS, CONFIRM_TIMEOUT_SEC, CORRECTION_WINDOW,
     FACE_IDS_DIR, SHARPNESS_THRESHOLD,
-    ENROLL_BUFFER_SIZE, ENROLL_MAX_YAW, ENROLL_MAX_ROLL, ENROLL_MIN_IOD,
-    ENROLL_BRIGHT_LO, ENROLL_BRIGHT_HI, ENROLL_BRIGHT_MIN_STD, ENROLL_TOP_K,
     STITCH_GAP_SEC,
-    detect_faces, detect_motion, detect_person, is_face_at_edge,
-    sharpness, zoom_crop, recognition_worker,
+    label_face_zoom, zoom_crop,
 )
 
 
@@ -88,7 +82,6 @@ STATUS_SUCCESSFUL     = "successful"      # greet / intro completed cleanly
 # ── Recognition debounce / capture timing ────────────────────────────────────
 # At ~6 detection cycles per second, 3 observations yields a decision in ~0.5 s.
 RECOG_VOTES_REQUIRED      = 3
-RECOG_AGREE_MIN           = 2
 RECOG_TIMEOUT_SEC         = 6.0
 # look_level is a quick body-tilt back to level. stand_up from sit is a full
 # rise (leg unfold + balance) and runs noticeably longer, so its stabilization
@@ -269,21 +262,6 @@ def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
     return " ".join(words)
 
 
-def _tally_recognition(obs):
-    """Return ``(verdict, kind)`` from a sequence of recognition observations.
-
-    Each observation is a name string (known) or None (unknown). Returns
-    (name, "known"), (None, "unknown"), or (None, "ambiguous") depending on
-    whether RECOG_AGREE_MIN of the observations agree.
-    """
-    if not obs:
-        return None, "ambiguous"
-    val, count = Counter(obs).most_common(1)[0]
-    if count < RECOG_AGREE_MIN:
-        return None, "ambiguous"
-    return val, ("known" if val else "unknown")
-
-
 # ── tick result type ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -349,31 +327,9 @@ class RecogGreetingTask:
         self._action_queue = action_queue
         self._say_queue    = say_queue
         self._prep_queue   = prep_queue
-        self._recognizer   = recognizer
-        self._stop_event   = stop_event
 
-        # Recognition worker thread (owned by this task).
-        self._rec_in:  Queue = Queue(maxsize=1)
-        self._rec_out: Queue = Queue(maxsize=1)
-        self._rec_thread = None
-        if recognizer is not None:
-            self._rec_thread = threading.Thread(
-                target=recognition_worker,
-                args=(recognizer, self._rec_in, self._rec_out, stop_event),
-                daemon=True,
-            )
-            self._rec_thread.start()
-
-        # ── Per-frame sense state (lives across ticks) ───────────────────
-        self._last_faces           = []
-        self._last_complete_faces  = []
-        self._last_rec_faces       = []   # bundle from worker
-        self._last_rec_names       = []
-        self._detect_counter       = 0
-        self._prev_frame           = None
-        self._frame_w              = 0
-        self._frame_h              = 0
-        self._last_motion_time     = 0.0   # debounces motion trigger
+        # All cv2 / image / recognition-worker state lives behind this.
+        self._perception = Perception(recognizer, stop_event)
 
         # ── State machine ────────────────────────────────────────────────
         self._phase                = IDLE
@@ -382,14 +338,11 @@ class RecogGreetingTask:
         self._camera_pose          = "level"
         self._seek_start           = 0.0
         self._last_introduced      = 0.0
-        self._last_complete_seen   = 0.0
         # Suppresses chain-repeats of "Sorry, I cannot see you clearly"
         # — see SEE_COMPLAINT_COOLDOWN in vision.py.
         self._last_see_complaint_at = 0.0
 
-        # Recognition state for the current RECOGNIZING phase.
-        self._recog_obs              = deque(maxlen=RECOG_VOTES_REQUIRED)
-        self._recog_best_face        = None
+        # RECOGNIZING-phase timing (task-side gate on when to start voting).
         self._recog_stabilize_until  = 0.0
 
         # Per-name cooldown — persists for the life of the task so the same
@@ -416,13 +369,6 @@ class RecogGreetingTask:
             "speech_end_t": 0.0,    # end of audible speech in the held clip
             "expires_at":   0.0,    # monotonic wall-clock deadline
         }
-
-        # Ring buffer of candidate face captures collected during the
-        # introducing window. Scored and picked at enrollment time so
-        # we deliberate over many frames instead of greedily committing
-        # to the first sharp one in real time (which often turned out
-        # to be a poor-pose capture).
-        self._enroll_candidates: deque = deque(maxlen=ENROLL_BUFFER_SIZE)
 
         # Confirmation state: a bare-name parse from the introducing window
         # (e.g. Whisper transcribed "Enjoy" for the user's slow "My name is
@@ -465,11 +411,10 @@ class RecogGreetingTask:
             "Sorry, I didn't catch your name.",
             "Sorry, I cannot see you clearly.",
         ]
-        if self._recognizer is not None:
-            for name in getattr(self._recognizer, "known", {}):
-                display = name.replace("_", " ").title()
-                phrases.append(f"Hi, {display}")
-                phrases.append(f"Nice to meet you, {display}!")
+        for name in self._perception.known_names():
+            display = name.replace("_", " ").title()
+            phrases.append(f"Hi, {display}")
+            phrases.append(f"Nice to meet you, {display}!")
         return phrases
 
     # ── Per-iteration tick ───────────────────────────────────────────────
@@ -481,29 +426,34 @@ class RecogGreetingTask:
         log this iteration.
         """
         # ── SENSE ────────────────────────────────────────────────────────
-        img = self._pull_latest_frame()
-        motion_seen = self._sense_motion_and_faces(now, img)
-        rec_got_new = self._pull_latest_recognition()
+        # Drain the frame queue, keep the newest. All downstream perception
+        # runs on this single frame.
+        img = None
+        try:
+            while True:
+                img = self._frame_queue.get_nowait()
+        except Empty:
+            pass
 
-        # Refresh "have we seen a complete face recently" tracker.
-        if self._last_complete_faces:
-            self._last_complete_seen = now
+        motion_seen = self._perception.sense_motion_and_faces(
+            now, img, MOTION_COOLDOWN)
+        rec_got_new = self._perception.pull_latest_recognition()
 
         # Update recognition vote buffer + best-face capture if applicable.
         if self._phase == RECOGNIZING:
-            if rec_got_new and self._last_rec_faces \
+            if rec_got_new and self._perception.last_rec_faces \
                     and now >= self._recog_stabilize_until:
-                self._accumulate_vote()
-            if img is not None and self._last_complete_faces \
+                self._perception.accumulate_vote()
+            if img is not None and self._perception.last_complete_faces \
                     and now >= self._recog_stabilize_until:
-                self._update_best_face(img)
+                self._perception.update_best_face(img)
 
         # Append face captures to the candidate buffer during enrollment.
         # The best one is picked from the buffer when submit_transcript
         # fires successful enrollment.
         if self._enroll_state["active"] and img is not None \
-                and self._last_complete_faces:
-            self._capture_enroll_candidate(img)
+                and self._perception.last_complete_faces:
+            self._perception.capture_enroll_candidate(img)
 
         # Pending held transcript expired with no continuation: apologise
         # (first time) or close silently (second time, post-retry).
@@ -533,7 +483,8 @@ class RecogGreetingTask:
             self._commit_enrollment(now, display_name)
 
         # ── RESPOND: advance the state machine ───────────────────────────
-        result = TickResult(latest_frame=img, latest_faces=self._last_faces)
+        result = TickResult(latest_frame=img,
+                            latest_faces=self._perception.last_faces)
         if self._phase == IDLE:
             self._tick_idle(now, motion_seen, img)
         elif self._phase == SEEKING:
@@ -754,43 +705,7 @@ class RecogGreetingTask:
             except Exception:
                 pass
 
-        top_k = self._pick_enroll_top_k()
-        if not top_k:
-            # Should never happen — _enter_introducing seeds the buffer
-            # with at least the recog_best_face. Defensive.
-            print("Task[recog_greeting]: no enrollment candidates in "
-                  "buffer — skipping", flush=True)
-            enrolled = False
-        elif self._recognizer:
-            # Multi-template enrollment: save each of the top-K as a
-            # distinct embedding under the same identity. Recognition
-            # later matches by max cosine across the set, so different
-            # poses captured during this single window all contribute.
-            #
-            # trust_name=True on every call: the user verbally said this
-            # name a moment ago, so similarity-vs-existing-embeddings
-            # checks would create a circular failure.
-            enrolled = False
-            for best in top_k:
-                ok = self._recognizer.enroll_new(
-                    dir_name,
-                    best["frame"],
-                    best["landmarks"],
-                    best["bbox"],
-                    save_dir,
-                    trust_name=True,
-                )
-                enrolled = enrolled or ok
-        else:
-            # No recognizer loaded — fall back to saving the captured
-            # frames only (no embeddings). next_image_index gives each a
-            # distinct NNN.jpg so repeat enrollments don't overwrite.
-            os.makedirs(save_dir, exist_ok=True)
-            for best in top_k:
-                idx = face_recognizer.next_image_index(save_dir)
-                cv2.imwrite(os.path.join(save_dir, f"{idx:03d}.jpg"),
-                            best["frame"])
-            enrolled = True
+        enrolled = self._perception.enroll_person(dir_name, save_dir)
         self._enroll_state["active"] = False
         self._confirm_state["active"] = False
 
@@ -935,23 +850,7 @@ class RecogGreetingTask:
         if old_dir == new_dir:
             return False
 
-        if self._recognizer is not None:
-            self._recognizer.rename(old_dir, new_dir)
-        else:
-            # Fallback: directory move without an embedding map.
-            import shutil
-            src = os.path.join(FACE_IDS_DIR, old_dir)
-            dst = os.path.join(FACE_IDS_DIR, new_dir)
-            if os.path.isdir(src) and not os.path.isdir(dst):
-                os.rename(src, dst)
-            elif os.path.isdir(src) and os.path.isdir(dst):
-                # Merge by best-effort copy then remove
-                for fname in os.listdir(src):
-                    shutil.move(os.path.join(src, fname), dst)
-                try:
-                    os.rmdir(src)
-                except OSError:
-                    pass
+        self._perception.rename_person(old_dir, new_dir)
 
         # Carry the per-name cooldown over so we don't re-greet under
         # the new name in the next tick.
@@ -974,273 +873,17 @@ class RecogGreetingTask:
               flush=True)
         return True
 
-    # ── SENSE helpers ────────────────────────────────────────────────────
-
-    def _pull_latest_frame(self) -> Optional[np.ndarray]:
-        """Drain frame_queue, keeping only the newest frame."""
-        img = None
-        try:
-            while True:
-                img = self._frame_queue.get_nowait()
-        except Empty:
-            pass
-        return img
-
-    def _sense_motion_and_faces(self, now, img) -> bool:
-        """Run motion+person detection and the periodic face detector.
-
-        Returns True if motion+person was seen on this tick — used as the
-        IDLE -> SEEKING trigger.
-        """
-        if img is None:
-            return False
-
-        motion_seen = False
-        if (now - self._last_motion_time >= MOTION_COOLDOWN
-                and detect_motion(img, self._prev_frame)
-                and detect_person(img)):
-            motion_seen = True
-            self._last_motion_time = now
-        self._prev_frame = img
-
-        # Periodic face detection — every N frames.
-        self._detect_counter += 1
-        if self._detect_counter >= FACE_DETECT_EVERY:
-            self._detect_counter = 0
-            self._last_faces = detect_faces(img)
-            img_h, img_w = img.shape[:2]
-            self._frame_w, self._frame_h = img_w, img_h
-            self._last_complete_faces = [
-                f for f in self._last_faces
-                if not is_face_at_edge(f, img_w, img_h)
-            ]
-            if self._recognizer and self._last_faces:
-                try:
-                    self._rec_in.put_nowait((img.copy(), self._last_faces))
-                except Exception:
-                    pass
-        return motion_seen
-
-    def _pull_latest_recognition(self) -> bool:
-        """Drain rec_out, keeping only the newest bundle. Returns True if a
-        new bundle arrived this tick."""
-        got = False
-        try:
-            while True:
-                self._last_rec_faces, self._last_rec_names = self._rec_out.get_nowait()
-                got = True
-        except Empty:
-            pass
-        return got
-
-    def _accumulate_vote(self):
-        """Add one recognition vote for the biggest fully-framed face."""
-        complete_rec = ([f for f in self._last_rec_faces
-                         if not is_face_at_edge(f, self._frame_w, self._frame_h)]
-                        if self._frame_w and self._frame_h else [])
-        if not complete_rec:
-            return
-        biggest = max(complete_rec, key=lambda f: f[2] * f[3])
-        idx = self._last_rec_faces.index(biggest)
-        rec_name = (self._last_rec_names[idx]
-                    if idx < len(self._last_rec_names) else None)
-        self._recog_obs.append(rec_name)
-
-    def _update_best_face(self, img: np.ndarray):
-        """Track the sharpest complete face this RECOGNIZING session has seen."""
-        biggest = max(self._last_complete_faces, key=lambda f: f[2] * f[3])
-        bx, by, bw, bh = biggest[:4]
-        region = img[by:by + bh, bx:bx + bw]
-        if region.size == 0:
-            return
-        s = sharpness(region)
-        if self._recog_best_face is None or s > self._recog_best_face["sharpness"]:
-            self._recog_best_face = {
-                "img":       img.copy(),
-                "bbox":      (bx, by, bw, bh),
-                "landmarks": biggest[4] if len(biggest) > 4 else None,
-                "sharpness": s,
-            }
-
-    def _capture_enroll_candidate(self, img: np.ndarray):
-        """Append the current largest detected face to the candidate buffer.
-
-        Replaces the older greedy "keep only the sharpest" approach: by
-        retaining many candidates we can score them on more than just
-        sharpness at enrollment time (see _pick_enroll_best).
-        """
-        biggest = max(self._last_complete_faces, key=lambda f: f[2] * f[3])
-        bx, by, bw, bh = biggest[:4]
-        region = img[by:by + bh, bx:bx + bw]
-        if region.size == 0:
-            return
-        s = sharpness(region)
-        self._enroll_candidates.append({
-            "frame":     img.copy(),
-            "landmarks": biggest[4] if len(biggest) > 4 else None,
-            "bbox":      (bx, by, bw, bh),
-            "sharpness": s,
-        })
-
-    def _pick_enroll_top_k(self, k: int = ENROLL_TOP_K) -> list:
-        """Score the buffered candidates and return up to `k` survivors.
-
-        Each candidate passes through hard ISO/IEC 29794-5-style gates
-        (yaw, roll, inter-ocular distance, face-region brightness) before
-        being ranked by a weighted sum of normalised sharpness + pose +
-        IOD + brightness. Top-K survivors are returned in descending
-        score order — they will all be enrolled as distinct embeddings
-        under the same identity (multi-template enrollment, the dominant
-        production pattern per NIST FRVT).
-
-        If every candidate fails the gates, the top-K by relaxed score
-        are returned anyway so a user who said their name doesn't get
-        silently dropped; the journal log notes the fallback.
-        """
-        if not self._enroll_candidates:
-            return []
-
-        scored = []
-        reject_reasons: Counter = Counter()
-        for c in self._enroll_candidates:
-            score, reason = self._enroll_candidate_score(c)
-            scored.append((score, reason, c))
-            if score == float("-inf"):
-                # Extract the gate name from the reason string. Reasons
-                # look like "yaw=0.45>0.30", "iod=40<60", "dark(mean=20)",
-                # "no_landmarks", etc. Pull off the leading identifier
-                # before "=" or "(" for the histogram.
-                gate = reason.split("=")[0].split("(")[0]
-                reject_reasons[gate] += 1
-
-        survivors = [(s, r, c) for s, r, c in scored if s > float("-inf")]
-        rejected  = len(scored) - len(survivors)
-        gate_summary = (", ".join(f"{g}={n}"
-                                  for g, n in reject_reasons.most_common())
-                        or "none")
-
-        if survivors:
-            survivors.sort(key=lambda x: x[0], reverse=True)
-            top = survivors[:k]
-            print(f"Task[recog_greeting]: enrolling top {len(top)} of "
-                  f"{len(self._enroll_candidates)} candidates "
-                  f"({rejected} rejected by gates: {gate_summary})",
-                  flush=True)
-        else:
-            # Pathological case — all gated out. Re-score with gates off
-            # so we still enroll *something*: the user gave their name,
-            # they expect to be remembered.
-            relaxed = [(self._enroll_candidate_relaxed_score(c), c)
-                       for c in self._enroll_candidates]
-            relaxed.sort(key=lambda x: x[0], reverse=True)
-            top = [(score, "fallback", c) for score, c in relaxed[:k]]
-            print(f"Task[recog_greeting]: WARN all "
-                  f"{len(self._enroll_candidates)} candidates failed "
-                  f"quality gates ({gate_summary}); falling back to "
-                  f"relaxed score (top {len(top)})", flush=True)
-
-        for i, (score, reason, c) in enumerate(top, 1):
-            print(f"  #{i}: score={score:.2f} sharp={c['sharpness']:.0f} "
-                  f"({reason})", flush=True)
-        return [c for _, _, c in top]
-
-    @staticmethod
-    def _enroll_candidate_score(c: dict) -> tuple:
-        """Return (score, reason). score is -inf when a hard gate fails.
-
-        Hard gates (ISO/IEC 29794-5 inspired):
-          * yaw  > ENROLL_MAX_YAW       — face turned too far sideways
-          * roll > ENROLL_MAX_ROLL      — head tilted too much
-          * IOD  < ENROLL_MIN_IOD       — face too small / far away
-          * brightness mean outside [LO, HI] or std too low (washed-out)
-
-        Survivors get a weighted sum in [0, 1] of normalised components:
-            0.4 * sharpness + 0.3 * pose + 0.2 * IOD + 0.1 * brightness
-        Weights follow the FIQA literature's empirical findings
-        (sharpness + pose dominate, IOD is a strong tiebreaker, brightness
-        small but real).
-        """
-        s   = c["sharpness"]
-        lm  = c["landmarks"]
-        if lm is None or len(lm) < 3:
-            return float("-inf"), "no_landmarks"
-
-        left_eye, right_eye, nose = lm[0], lm[1], lm[2]
-        eye_mid_x = (left_eye[0] + right_eye[0]) * 0.5
-        iod       = float(((right_eye[0] - left_eye[0]) ** 2
-                           + (right_eye[1] - left_eye[1]) ** 2) ** 0.5)
-        if iod < 1e-3:
-            return float("-inf"), "iod_zero"
-
-        yaw_offset = abs(nose[0] - eye_mid_x) / iod
-        roll_norm  = abs(right_eye[1] - left_eye[1]) / iod
-
-        if iod < ENROLL_MIN_IOD:
-            return float("-inf"), f"iod={iod:.0f}<{ENROLL_MIN_IOD:.0f}"
-        if yaw_offset > ENROLL_MAX_YAW:
-            return float("-inf"), f"yaw={yaw_offset:.2f}>{ENROLL_MAX_YAW:.2f}"
-        if roll_norm > ENROLL_MAX_ROLL:
-            return float("-inf"), f"roll={roll_norm:.2f}>{ENROLL_MAX_ROLL:.2f}"
-
-        # Brightness check on the bbox region (cheap, no extra detection).
-        bx, by, bw, bh = c["bbox"]
-        frame = c["frame"]
-        face_region = frame[by:by + bh, bx:bx + bw]
-        if face_region.size == 0:
-            return float("-inf"), "bbox_empty"
-        gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
-        bright_mean = float(gray.mean())
-        bright_std  = float(gray.std())
-        if bright_mean < ENROLL_BRIGHT_LO:
-            return float("-inf"), f"dark(mean={bright_mean:.0f})"
-        if bright_mean > ENROLL_BRIGHT_HI:
-            return float("-inf"), f"bright(mean={bright_mean:.0f})"
-        if bright_std < ENROLL_BRIGHT_MIN_STD:
-            return float("-inf"), f"flat(std={bright_std:.0f})"
-
-        # Normalise each component into [0, 1].
-        sharp_n  = min(1.0, s / 200.0)        # 200 ~ "good" sharpness
-        pose_n   = ((1.0 - yaw_offset / ENROLL_MAX_YAW)
-                    * (1.0 - roll_norm / ENROLL_MAX_ROLL))
-        iod_n    = min(1.0, iod / 120.0)      # 120 px ~ "good" face size at 720p
-        bright_n = max(0.0, 1.0 - abs(bright_mean - 128.0) / 64.0)
-
-        score = (0.4 * sharp_n
-                 + 0.3 * pose_n
-                 + 0.2 * iod_n
-                 + 0.1 * bright_n)
-        return score, "ok"
-
-    @staticmethod
-    def _enroll_candidate_relaxed_score(c: dict) -> float:
-        """Gates-off fallback used only when every candidate is gated out.
-
-        Same intuition as the old single-metric scorer: sharpness times a
-        soft frontality factor (yaw only), so the least-bad candidate is
-        picked. Kept tiny because it should almost never fire.
-        """
-        s  = c["sharpness"]
-        lm = c["landmarks"]
-        if lm is None or len(lm) < 3:
-            return s * 0.5
-        eye_mid_x  = (lm[0][0] + lm[1][0]) * 0.5
-        eye_width  = abs(lm[1][0] - lm[0][0]) + 1e-6
-        yaw_offset = abs(lm[2][0] - eye_mid_x) / eye_width
-        yaw_q      = max(0.0, 1.0 - yaw_offset / 0.3)
-        return s * (0.5 + 0.5 * yaw_q)
-
     # ── Phase advance helpers ────────────────────────────────────────────
 
     def _tick_idle(self, now, motion_seen, img):
         """Wait for a trigger — either a face already visible at level (skip
         seeking) or motion+person (look up to find a face)."""
-        if img is not None and self._last_complete_faces:
+        if img is not None and self._perception.last_complete_faces:
             self._phase                  = RECOGNIZING
             self._phase_entered          = now
-            self._recog_obs.clear()
-            self._recog_best_face        = None
+            self._perception.reset_recognizing()
             self._recog_stabilize_until  = 0.0
-            self._last_complete_seen     = now
+            self._perception.last_complete_seen     = now
             self._camera_pose            = "level"
             print("Task[recog_greeting]: -> recognizing "
                   "(face visible at level)", flush=True)
@@ -1257,7 +900,7 @@ class RecogGreetingTask:
                   flush=True)
 
     def _tick_seeking(self, now, img, result: TickResult) -> TickResult:
-        if self._last_complete_faces:
+        if self._perception.last_complete_faces:
             # Found a face — transition to RECOGNIZING while STAYING in the
             # current seek pose. Recovery is queued only when we leave
             # RECOGNIZING, so the body holds steady through vote accumulation.
@@ -1269,11 +912,10 @@ class RecogGreetingTask:
                 stabilize_sec = 0.0
             self._phase                 = RECOGNIZING
             self._phase_entered         = now
-            self._recog_obs.clear()
-            self._recog_best_face       = None
+            self._perception.reset_recognizing()
             self._recog_stabilize_until = (now + stabilize_sec
                                            if stabilize_sec > 0 else 0.0)
-            self._last_complete_seen    = now
+            self._perception.last_complete_seen    = now
             print(f"Task[recog_greeting]: -> recognizing "
                   f"(holding {self._camera_pose} pose"
                   + (f", stabilizing for {stabilize_sec:.1f}s)"
@@ -1302,7 +944,7 @@ class RecogGreetingTask:
             except Exception:
                 pass
             self._camera_pose      = "level"
-            self._last_motion_time = now
+            self._perception.last_motion_time = now
             self._phase            = COOLDOWN
             self._phase_entered    = now
             print("Task[recog_greeting]: seek give-up -> cooldown", flush=True)
@@ -1310,9 +952,9 @@ class RecogGreetingTask:
         return result
 
     def _tick_recognizing(self, now, img, result: TickResult) -> TickResult:
-        decide_now = (len(self._recog_obs) >= RECOG_VOTES_REQUIRED
+        decide_now = (len(self._perception.recog_obs) >= RECOG_VOTES_REQUIRED
                       or now - self._phase_entered >= RECOG_TIMEOUT_SEC)
-        face_lost  = now - self._last_complete_seen > FACE_LOST_TIMEOUT_SEC
+        face_lost  = now - self._perception.last_complete_seen > FACE_LOST_TIMEOUT_SEC
 
         if decide_now:
             return self._dispatch_verdict(now, img, result)
@@ -1346,13 +988,13 @@ class RecogGreetingTask:
         except Exception:
             pass
         self._camera_pose       = "level"
-        self._last_motion_time  = now
+        self._perception.last_motion_time  = now
         print(f"Task[recog_greeting]: leaving recognizing, queueing "
               f"{'wait_for_tts -> ' if after_tts else ''}{recovery}",
               flush=True)
 
     def _dispatch_verdict(self, now, img, result: TickResult) -> TickResult:
-        verdict, kind = _tally_recognition(self._recog_obs)
+        verdict, kind = self._perception.tally()
         if kind == "known":
             return self._enter_greeting(now, img, verdict, result)
         if kind == "unknown":
@@ -1393,26 +1035,23 @@ class RecogGreetingTask:
             pass
         self._last_greeted[verdict] = now
         self._last_introduced       = now   # also suppress introduce
-        self._last_motion_time      = now
+        self._perception.last_motion_time      = now
 
         # Prefer the live frame for the zoom label, fall back to the captured
         # snapshot if the person has already moved out of frame.
-        if self._last_complete_faces and img is not None:
-            biggest = max(self._last_complete_faces, key=lambda f: f[2] * f[3])
+        if self._perception.last_complete_faces and img is not None:
+            biggest = max(self._perception.last_complete_faces, key=lambda f: f[2] * f[3])
             crop = zoom_crop(img, biggest)
-        elif self._recog_best_face is not None:
-            crop = zoom_crop(self._recog_best_face["img"],
-                             self._recog_best_face["bbox"])
+        elif self._perception.recog_best_face is not None:
+            crop = zoom_crop(self._perception.recog_best_face["img"],
+                             self._perception.recog_best_face["bbox"])
         else:
             crop = None
 
         if crop is not None:
-            zoom_bgr = crop.copy()
-            cv2.putText(zoom_bgr, verdict, (20, zoom_bgr.shape[0] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                        (0, 255, 0), 2, cv2.LINE_AA)
             result.display_request = DisplayRequest(
-                image=zoom_bgr, duration_sec=CAPTURE_DISPLAY_SEC)
+                image=label_face_zoom(crop, verdict),
+                duration_sec=CAPTURE_DISPLAY_SEC)
 
         self._phase          = GREETING
         self._phase_entered  = now
@@ -1439,8 +1078,8 @@ class RecogGreetingTask:
                   f"remaining) -> cooldown", flush=True)
             result.status_event = STATUS_NEW_PERSON
             return result
-        if (self._recog_best_face is None
-                or self._recog_best_face["sharpness"] < SHARPNESS_THRESHOLD):
+        if (self._perception.recog_best_face is None
+                or self._perception.recog_best_face["sharpness"] < SHARPNESS_THRESHOLD):
             # Let the person know why we're not engaging — but only if we
             # haven't said it recently. Without this cooldown, the same
             # too-blurry face standing in front of Pella triggers the
@@ -1459,8 +1098,8 @@ class RecogGreetingTask:
             self._queue_recovery(now, after_tts=apologise)
             self._phase         = COOLDOWN
             self._phase_entered = now
-            sharp_str = (f"{self._recog_best_face['sharpness']:.1f}"
-                         if self._recog_best_face else "none")
+            sharp_str = (f"{self._perception.recog_best_face['sharpness']:.1f}"
+                         if self._perception.recog_best_face else "none")
             silent = "" if apologise else \
                 f" (silent — within {SEE_COMPLAINT_COOLDOWN:.0f}s cooldown)"
             print(f"Task[recog_greeting]: unknown face not sharp enough "
@@ -1480,13 +1119,12 @@ class RecogGreetingTask:
         self._queue_recovery(now, after_tts=True)
         # Seed the candidate buffer with the recognition-phase best face
         # (the one that triggered introducing). More candidates accumulate
-        # via _capture_enroll_candidate across the introducing window.
-        self._enroll_candidates.clear()
-        self._enroll_candidates.append({
-            "frame":     self._recog_best_face["img"],
-            "landmarks": self._recog_best_face["landmarks"],
-            "bbox":      self._recog_best_face["bbox"],
-            "sharpness": self._recog_best_face["sharpness"],
+        # via perception.capture_enroll_candidate across the introducing window.
+        self._perception.seed_enroll_candidates({
+            "frame":     self._perception.recog_best_face["img"],
+            "landmarks": self._perception.recog_best_face["landmarks"],
+            "bbox":      self._perception.recog_best_face["bbox"],
+            "sharpness": self._perception.recog_best_face["sharpness"],
         })
         # Reset any leftover stitch buffer from a prior attempt.
         self._enroll_pending = {"text": None, "speech_end_t": 0.0,
@@ -1497,10 +1135,10 @@ class RecogGreetingTask:
         # session would otherwise gate cooldown forever.
         self._confirm_state["active"] = False
         self._last_introduced  = now
-        self._last_motion_time = now
+        self._perception.last_motion_time = now
 
-        crop = zoom_crop(self._recog_best_face["img"],
-                         self._recog_best_face["bbox"])
+        crop = zoom_crop(self._perception.recog_best_face["img"],
+                         self._perception.recog_best_face["bbox"])
         result.display_request = DisplayRequest(
             image=crop, duration_sec=CAPTURE_DISPLAY_SEC)
 
@@ -1508,7 +1146,7 @@ class RecogGreetingTask:
         self._phase_entered  = now
         result.status_event  = STATUS_NEW_PERSON
         print(f"Task[recog_greeting]: introducing, asking for name "
-              f"(sharpness={self._recog_best_face['sharpness']:.1f})",
+              f"(sharpness={self._perception.recog_best_face['sharpness']:.1f})",
               flush=True)
         return result
 

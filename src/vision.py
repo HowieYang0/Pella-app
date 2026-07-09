@@ -328,6 +328,21 @@ def zoom_crop(bgr: np.ndarray, face: tuple) -> np.ndarray:
     return bgr[y1:y2, x1:x2]
 
 
+def label_face_zoom(bgr: np.ndarray, label: str) -> np.ndarray:
+    """Overlay ``label`` at the bottom of a face-zoom crop.
+
+    Used by the task after a successful greet / introduce to build the
+    pinned display image — the crop shows the person, the label shows
+    the name Pella committed to. Returns a modified copy of ``bgr`` so
+    the caller can hand it straight to a DisplayRequest.
+    """
+    out = bgr.copy()
+    cv2.putText(out, label, (20, out.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                (0, 255, 0), 2, cv2.LINE_AA)
+    return out
+
+
 # ── Recognition ───────────────────────────────────────────────────────────────
 
 def load_recognizer():
