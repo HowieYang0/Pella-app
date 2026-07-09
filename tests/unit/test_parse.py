@@ -1,21 +1,18 @@
-"""Tests for the text parsers in recog_greeting.py.
+"""Tests for the text parsers in greeting.py.
 
 These functions convert raw Whisper transcripts into structured decisions
 about the enrollment / confirmation flow. They're pure text logic — no
 threads, no queues, no image data — so they're the highest-ROI thing to
 have real tests on. If any of these regresses, the effect is a mis-heard
 name silently enrolled or a valid one silently rejected.
-
-When these functions eventually move to greeting.py these tests should
-follow along; the assertions themselves don't depend on file structure.
 """
 
 import pytest
 
-from recog_greeting import (
-    _parse_name,
-    _parse_confirmation,
-    _has_intro_phrase,
+from greeting import (
+    parse_name as _parse_name,
+    parse_confirmation as _parse_confirmation,
+    has_intro_phrase as _has_intro_phrase,
 )
 
 

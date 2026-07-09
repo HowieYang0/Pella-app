@@ -28,7 +28,6 @@ transcripts via submit_transcript() and renders what the task asks.
 """
 
 import os
-import re
 from dataclasses import dataclass, field
 from queue import Empty
 from typing import Optional
@@ -36,6 +35,7 @@ from typing import Optional
 import numpy as np
 
 import actions
+import greeting
 from perception import Perception
 from vision import (
     GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
@@ -99,167 +99,6 @@ FACE_LOST_TIMEOUT_SEC     = 3.0
 GREETING_DURATION_SEC     = 6.0
 # Grace period after any interaction before the task re-engages.
 INTERACTION_COOLDOWN_SEC  = 5.0
-
-
-# ── Name parsing for the introducing path ────────────────────────────────────
-
-_NON_NAME_WORDS = {
-    # Pronouns
-    "i", "me", "my", "mine", "you", "your", "yours",
-    "he", "him", "his", "she", "her", "hers",
-    "it", "its", "we", "us", "our", "they", "them", "their",
-    "this", "that", "these", "those",
-    # Prepositions / particles
-    "for", "to", "from", "with", "of", "in", "on", "at", "by", "about",
-    # Auxiliary verbs
-    "is", "am", "are", "was", "were", "be",
-    "do", "does", "did", "have", "has", "had",
-    # Connectives / articles
-    "and", "or", "but", "the", "a", "an", "not",
-    # Question words
-    "what", "where", "when", "who", "why", "how", "which",
-    # Interjections / common responses
-    "yes", "no", "ok", "okay", "yeah", "nah", "uh", "um", "oh",
-    "hmm", "huh", "ugh", "eh", "mm", "mmm", "hm",
-    "hi", "hey", "hello", "bye",
-    # Polite / imperative words seen in mis-captures
-    "please", "thanks", "thank", "sorry",
-    "stop", "hold", "wait", "excuse", "tell", "give", "take",
-    # Common state replies after "I'm X" / "It's X" / "That's X" — would
-    # otherwise be mis-parsed as a name correction by the intro-phrase
-    # branch. Expanded to cover state words that follow the weaker
-    # "it's"/"that's" pointers added to intro_re.
-    "fine", "good", "great", "well", "alright", "tired", "busy",
-    "happy", "sad", "lost", "here", "back", "home", "ready",
-    "cool", "nice", "hot", "warm", "cold", "bad", "right", "wrong",
-    "true", "false", "late", "early", "easy", "hard", "fun", "old",
-    "new", "big", "small", "first", "last",
-}
-
-
-# Hoisted to module scope so _has_intro_phrase() can reuse it without
-# recompiling the regex per call. Same pattern as previously defined inside
-# _parse_name — see that function's docstring for what each alternative
-# matches and why.
-_INTRO_RE = re.compile(
-    r"(?:i am|i'm|i'?m\s+called|my\s+name\s+is|my\s+name'?s|name'?s|"
-    r"call\s+me|this\s+is|it'?s|it\s+is|that'?s|that\s+is)\s+(.+)",
-    re.IGNORECASE,
-)
-
-# Yes / no patterns for the "Did you say {name}?" confirmation reply.
-# Matched against the lowercased, punctuation-stripped transcript.
-# Anchored to start because we want the user's leading word to be the
-# affirmation/rejection — "yes, joy" / "no, joy" — not a buried token.
-_YES_RE = re.compile(
-    r"^(?:yes|yeah|yep|yup|sure|right|correct|that'?s\s+right|"
-    r"that\s+is\s+right|ok|okay)\b",
-    re.IGNORECASE,
-)
-_NO_RE = re.compile(
-    r"^(?:no|nope|nah|wrong|incorrect|not\s+quite|that'?s\s+wrong)\b(.*)",
-    re.IGNORECASE,
-)
-
-
-def _has_intro_phrase(text: str) -> bool:
-    """True iff the transcript contains an explicit name-intro phrase.
-
-    Used to decide whether a parsed name needs confirmation. A bare-word
-    transcript ("Joy" -> "Enjoy" via Whisper) goes through "Did you say X?"
-    because it's the hallucination failure mode; "My name is Joy" goes
-    straight to enrollment because it carries enough acoustic context for
-    Whisper to commit confidently.
-    """
-    return _INTRO_RE.search(text) is not None
-
-
-def _parse_confirmation(text: str):
-    """Parse a yes / no / correction reply to "Did you say {name}?".
-
-    Returns a tuple (verdict, new_name):
-      verdict   : "yes" | "no" | "unclear"
-      new_name  : a name parsed out of a "no, X" / "it's Y" / "my name
-                  is Z" reply, or None.
-
-    "yes" → commit the originally-parsed name.
-    "no" with new_name → commit the new name instead.
-    "no" without new_name → re-prompt for the name (consumes a retry slot).
-    "unclear" → ignore and keep waiting; tick() handles the timeout.
-    """
-    t = re.sub(r"[.,!?]+", " ", text.strip())
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return ("unclear", None)
-
-    # Check "no" first, because "no, joy" should NOT be confused with a
-    # bare-name parse of "joy" alone — the leading "no" is the signal.
-    no_match = _NO_RE.match(t)
-    if no_match:
-        rest = no_match.group(1).strip(" ,.;:-")
-        if rest:
-            new_name = _parse_name(rest)
-            if new_name:
-                return ("no", new_name)
-        return ("no", None)
-
-    if _YES_RE.match(t):
-        return ("yes", None)
-
-    # No explicit yes/no leading word — treat any successfully-parsed name
-    # as an implicit correction ("Joy." / "It's Joy." / "My name is Joy.").
-    new_name = _parse_name(t)
-    if new_name:
-        return ("no", new_name)
-
-    return ("unclear", None)
-
-
-def _parse_name(text: str, *, require_intro_phrase: bool = False) -> str:
-    """Extract a name from a casual reply, ignoring courtesy phrases.
-
-    Returns an empty string when the input doesn't look like a name — e.g.
-    contains common non-name words like 'excuse me' or 'hold it for me'.
-
-    When `require_intro_phrase=True`, only matches with an explicit
-    "my name is X" / "I am X" / "call me X" / etc. — bare names are
-    rejected. Used for *corrections* to a stored name: a casual reply
-    like "I'm fine, thanks" right after a greeting shouldn't accidentally
-    rename the person.
-    """
-    t = text.strip()
-    # Collapse ellipses ("..." or longer) to a single space before splitting
-    # on sentence punctuation. Whisper emits "..." for trailing-off speech
-    # ("My name is...") and the bare first-sentence split would otherwise
-    # cut the utterance at the first dot — losing the actual name that
-    # arrives after a stitch from the next clip.
-    t = re.sub(r"\.{2,}", " ", t)
-    t = re.split(r"[.!?]", t, maxsplit=1)[0].strip()
-    intro_re = _INTRO_RE
-    # Loop because a stitched transcript can look like "my name is ... my
-    # name is Joy" — peeling off only the first intro phrase would leave
-    # "my name is Joy" and trip the non-name-word filter on "my". Strip
-    # all intro phrases iteratively until none remain.
-    matched_any = False
-    while True:
-        m = intro_re.search(t)
-        if not m:
-            break
-        matched_any = True
-        t = m.group(1).strip()
-    if not matched_any and require_intro_phrase:
-        return ""
-    courtesy = (
-        r",|\s+and\b|"
-        r"\s+(?:nice|glad|pleased|happy)\s+(?:to\s+)?(?:meet|meeting)\b"
-    )
-    t = re.split(courtesy, t, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-    words = re.findall(r"[A-Za-z]+", t)
-    if not words:
-        return ""
-    if any(w.lower() in _NON_NAME_WORDS for w in words):
-        return ""
-    return " ".join(words)
 
 
 # ── tick result type ─────────────────────────────────────────────────────────
@@ -370,7 +209,7 @@ class RecogGreetingTask:
             "expires_at":   0.0,    # monotonic wall-clock deadline
         }
 
-        # Confirmation state: a bare-name parse from the introducing window
+        # Confirmation state: a bare-name parse from the 1introducing window
         # (e.g. Whisper transcribed "Enjoy" for the user's slow "My name is
         # Joy") routes here instead of enrolling immediately. Pella asks
         # "Did you say {display_name}?" and listens for a yes / no /
@@ -406,15 +245,9 @@ class RecogGreetingTask:
         Static prompts (always relevant) + a per-name "Hi, X" / "Nice to
         meet you, X" pair for each currently-enrolled person.
         """
-        phrases = [
-            "Hello, I am Pella. What is your name?",
-            "Sorry, I didn't catch your name.",
-            "Sorry, I cannot see you clearly.",
-        ]
+        phrases = list(greeting.static_warm_phrases())
         for name in self._perception.known_names():
-            display = name.replace("_", " ").title()
-            phrases.append(f"Hi, {display}")
-            phrases.append(f"Nice to meet you, {display}!")
+            phrases.extend(greeting.per_person_warm_phrases(name))
         return phrases
 
     # ── Per-iteration tick ───────────────────────────────────────────────
@@ -527,7 +360,7 @@ class RecogGreetingTask:
         if attempts < ENROLL_MAX_ATTEMPTS:
             try:
                 self._say_queue.put_nowait(
-                    "Sorry, I didn't catch your name.")
+                    greeting.name_apology())
             except Exception:
                 pass
             self._enroll_state["attempts"] = attempts + 1
@@ -576,10 +409,10 @@ class RecogGreetingTask:
                 # enrollment check below, since enroll is not active).
                 self._correction_state["active"] = False
             else:
-                new_name = _parse_name(text, require_intro_phrase=True)
+                new_name = greeting.parse_name(text, require_intro_phrase=True)
                 if new_name:
                     old_dir = self._correction_state["dir_name"]
-                    new_dir = new_name.lower().replace(" ", "_")
+                    new_dir, _new_disp = greeting.canonicalize(new_name)
                     if new_dir != old_dir:
                         if self._apply_correction(new_name):
                             self._correction_state["active"] = False
@@ -646,7 +479,7 @@ class RecogGreetingTask:
                 self._enroll_pending = {"text": None, "speech_end_t": 0.0,
                                         "expires_at": 0.0}
 
-        name_raw = _parse_name(combined_text)
+        name_raw = greeting.parse_name(combined_text)
         if not name_raw:
             # Don't apologise yet — hold this transcript for STITCH_GAP_SEC
             # in case the rest of the utterance arrives in the next
@@ -667,7 +500,7 @@ class RecogGreetingTask:
         # an explicit confirmation step before we persist anything to
         # disk. Multi-word intro-phrase transcripts skip this — they
         # carry enough acoustic context that Whisper rarely substitutes.
-        if not _has_intro_phrase(combined_text):
+        if not greeting.has_intro_phrase(combined_text):
             self._enter_confirming(now, name_raw)
             return True
 
@@ -686,20 +519,15 @@ class RecogGreetingTask:
             say X?" → "Yes" / timeout / "No, Y") in
             _handle_confirmation_reply / the tick timeout.
         """
-        dir_name     = name_raw.lower().replace(" ", "_")
-        display_name = name_raw.title()
-        save_dir     = os.path.join(FACE_IDS_DIR, dir_name)
+        dir_name, display_name = greeting.canonicalize(name_raw)
+        save_dir = os.path.join(FACE_IDS_DIR, dir_name)
 
         # Kick off TTS pre-cache for whichever phrase we'll say next, RIGHT
         # NOW — generation + audiohub upload (~10-20 s) will overlap with
         # enrollment (~1-2 s) and any time the user spent talking. By the
         # time we actually put the phrase on say_queue, the cache should
         # be partially or fully warm and playback fires sooner.
-        for prep_text in (
-            f"Nice to meet you, {display_name}!",
-            f"You don't look like the {display_name} I know. "
-            f"Sorry about that.",
-        ):
+        for prep_text in greeting.intro_warm_phrases(display_name):
             try:
                 self._prep_queue.put_nowait(prep_text)
             except Exception:
@@ -711,12 +539,9 @@ class RecogGreetingTask:
 
         try:
             if enrolled:
-                self._say_queue.put_nowait(
-                    f"Nice to meet you, {display_name}!")
+                self._say_queue.put_nowait(greeting.welcome_phrase(display_name))
             else:
-                self._say_queue.put_nowait(
-                    f"You don't look like the {display_name} I know. "
-                    f"Sorry about that.")
+                self._say_queue.put_nowait(greeting.reject_phrase(display_name))
             print(f"Task[recog_greeting]: "
                   f"{'enrolled' if enrolled else 'rejected'}: {display_name}",
                   flush=True)
@@ -740,10 +565,9 @@ class RecogGreetingTask:
         starts). The phase stays INTRODUCING — _tick_introducing won't
         exit to COOLDOWN while either of these is active.
         """
-        dir_name     = name_raw.lower().replace(" ", "_")
-        display_name = name_raw.title()
+        dir_name, display_name = greeting.canonicalize(name_raw)
         try:
-            self._say_queue.put_nowait(f"Did you say {display_name}?")
+            self._say_queue.put_nowait(greeting.confirmation_prompt(display_name))
         except Exception as e:
             print(f"Task[recog_greeting]: WARN say_queue full, "
                   f"confirmation not queued: {e}", flush=True)
@@ -785,7 +609,7 @@ class RecogGreetingTask:
             # Tick should have already fired the timeout; defensive.
             return False
 
-        verdict, new_name = _parse_confirmation(text)
+        verdict, new_name = greeting.parse_confirmation(text)
         display_name = self._confirm_state["display_name"]
         if verdict == "yes":
             print(f"Task[recog_greeting]: confirmation 'yes' for "
@@ -844,9 +668,8 @@ class RecogGreetingTask:
         the in-memory per-name cooldown so the rename doesn't make the
         person eligible for an immediate re-greeting under the new name.
         """
-        old_dir  = self._correction_state["dir_name"]
-        new_dir  = new_name_raw.lower().replace(" ", "_")
-        new_disp = new_name_raw.title()
+        old_dir = self._correction_state["dir_name"]
+        new_dir, new_disp = greeting.canonicalize(new_name_raw)
         if old_dir == new_dir:
             return False
 
@@ -858,14 +681,14 @@ class RecogGreetingTask:
             self._last_greeted[new_dir] = self._last_greeted.pop(old_dir)
 
         # Pre-warm TTS for the new name (most likely the next greeting).
-        for prep_text in (f"Hi, {new_disp}", f"Nice to meet you, {new_disp}!"):
+        for prep_text in greeting.correction_warm_phrases(new_disp):
             try:
                 self._prep_queue.put_nowait(prep_text)
             except Exception:
                 pass
 
         try:
-            self._say_queue.put_nowait(f"Sorry, {new_disp}. Got it.")
+            self._say_queue.put_nowait(greeting.correction_ack(new_disp))
         except Exception:
             pass
 
@@ -1009,7 +832,7 @@ class RecogGreetingTask:
         return result
 
     def _enter_greeting(self, now, img, verdict, result: TickResult) -> TickResult:
-        display_name = verdict.replace("_", " ").title()
+        display_name = greeting.display_name_from_dir_name(verdict)
         if (now - self._last_greeted.get(verdict, 0.0)) < GREET_COOLDOWN:
             # Recovery still needed; no TTS so no wait.
             self._queue_recovery(now, after_tts=False)
@@ -1025,7 +848,7 @@ class RecogGreetingTask:
         # has had time to come through the speaker. wiggle lands after
         # recovery as the final gesture.
         try:
-            self._say_queue.put_nowait(f"Hi, {display_name}")
+            self._say_queue.put_nowait(greeting.greet_phrase(display_name))
         except Exception:
             pass
         self._queue_recovery(now, after_tts=True)
@@ -1089,7 +912,7 @@ class RecogGreetingTask:
             if apologise:
                 try:
                     self._say_queue.put_nowait(
-                        "Sorry, I cannot see you clearly.")
+                        greeting.clarity_apology())
                     self._last_see_complaint_at = now
                 except Exception:
                     apologise = False
@@ -1112,7 +935,7 @@ class RecogGreetingTask:
         # Pella…" prompt plays through before stand_up kicks the motors.
         try:
             self._say_queue.put_nowait(
-                "Hello, I am Pella. What is your name?")
+                greeting.intro_prompt())
         except Exception as e:
             print(f"Task[recog_greeting]: WARN say_queue full, "
                   f"name-ask not queued: {e}", flush=True)
