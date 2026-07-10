@@ -115,8 +115,14 @@ ENROLL_BUFFER_SIZE   = 40     # max # of candidate face captures retained
 # survivors are ranked for multi-template enrollment.
 ENROLL_MAX_YAW       = 0.30   # nose offset / inter-eye distance
 ENROLL_MAX_ROLL      = 0.27   # |eye_y_diff| / inter-eye distance ≈ tan(15°)
-ENROLL_MIN_IOD       = 60.0   # inter-ocular distance in pixels — small faces
-                              # produce noisy ArcFace embeddings
+ENROLL_MIN_IOD       = 45.0   # inter-ocular distance in pixels — small faces
+                              # produce noisy ArcFace embeddings.
+                              # 45 covers a face at ~2 m through the Go2s
+                              # 720p × ~72° FOV front camera (IOD lands at
+                              # ~45-55 px there). At 60 that distance fell
+                              # into the relaxed-scoring fallback for every
+                              # candidate; 45 lets normal-distance guests
+                              # enroll through the main FIQA scorer.
 ENROLL_BRIGHT_LO     = 60.0   # mean grey of face region: below = under-exposed
 ENROLL_BRIGHT_HI     = 200.0  # mean grey of face region: above = blown out
 ENROLL_BRIGHT_MIN_STD = 25.0  # std-dev of face region: below = washed out
