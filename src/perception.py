@@ -43,6 +43,13 @@ from vision import (
 RECOG_VOTES_REQUIRED = 3
 RECOG_AGREE_MIN      = 2
 
+# Below this Laplacian-variance value the face crop is too blurry to be
+# worth keeping in the enrollment candidate buffer at all — cheaper to
+# drop it at capture time than to score and reject it later. Tuned so
+# obvious motion-blur frames get filtered while a mildly soft frame from
+# a still user still passes through.
+CAPTURE_SHARPNESS_MIN = 30.0
+
 
 # ── Enrollment candidate scoring (was static on RecogGreetingTask) ──────────
 
@@ -56,10 +63,12 @@ def _enroll_candidate_score(c: dict) -> tuple:
       * brightness mean outside [LO, HI] or std too low (washed-out)
 
     Survivors get a weighted sum in [0, 1] of normalised components:
-        0.4 * sharpness + 0.3 * pose + 0.2 * IOD + 0.1 * brightness
-    Weights follow the FIQA literature's empirical findings
-    (sharpness + pose dominate, IOD is a strong tiebreaker, brightness
-    small but real).
+        0.55 * sharpness + 0.2 * pose + 0.15 * IOD + 0.1 * brightness
+    Sharpness is weighted higher than the FIQA-lit default (0.4) because
+    pose is already constrained by the yaw/roll hard gates above — any
+    candidate that reaches the weighted-sum step is roughly frontal, so
+    sharpness is the discriminator that actually varies. IOD gets a
+    proportional cut for the same reason (it also has a hard gate).
     """
     s   = c["sharpness"]
     lm  = c["landmarks"]
@@ -106,10 +115,10 @@ def _enroll_candidate_score(c: dict) -> tuple:
     iod_n    = min(1.0, iod / 120.0)      # 120 px ~ "good" face size at 720p
     bright_n = max(0.0, 1.0 - abs(bright_mean - 128.0) / 64.0)
 
-    score = (0.4 * sharp_n
-             + 0.3 * pose_n
-             + 0.2 * iod_n
-             + 0.1 * bright_n)
+    score = (0.55 * sharp_n
+             + 0.20 * pose_n
+             + 0.15 * iod_n
+             + 0.10 * bright_n)
     return score, "ok"
 
 
@@ -358,6 +367,10 @@ class Perception:
         Replaces the older greedy "keep only the sharpest" approach: by
         retaining many candidates we can score them on more than just
         sharpness at enrollment time (see pick_enroll_top_k).
+
+        Frames below CAPTURE_SHARPNESS_MIN are dropped here rather than
+        buffered — a motion-blurred crop that survives to scoring only
+        crowds out sharper candidates from the fixed-size deque.
         """
         biggest = max(self.last_complete_faces, key=lambda f: f[2] * f[3])
         bx, by, bw, bh = biggest[:4]
@@ -365,6 +378,8 @@ class Perception:
         if region.size == 0:
             return
         s = sharpness(region)
+        if s < CAPTURE_SHARPNESS_MIN:
+            return
         self.enroll_candidates.append({
             "frame":     img.copy(),
             "landmarks": biggest[4] if len(biggest) > 4 else None,

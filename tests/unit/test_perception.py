@@ -4,6 +4,7 @@ Covers the perception surface the task actually consumes:
   - tally() — vote-buffer aggregation
   - reset_recognizing() — RECOGNIZING-phase teardown
   - seed_enroll_candidates() — INTRODUCING-phase seeding
+  - capture_enroll_candidate() — the sharpness gate at buffer-append time
   - known_names() — pass-through into the recognizer
   - accumulate_vote() — the biggest-face-in-bundle picking logic
   - pull_latest_recognition() — draining the worker output queue
@@ -16,9 +17,12 @@ or heavy mocking, so we exercise them on the dock, not in unit tests.
 import threading
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
-from perception import Perception, RECOG_VOTES_REQUIRED, RECOG_AGREE_MIN
+from perception import (
+    Perception, RECOG_VOTES_REQUIRED, RECOG_AGREE_MIN, CAPTURE_SHARPNESS_MIN,
+)
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -259,6 +263,52 @@ def test_pull_latest_recognition_keeps_only_newest(perc_no_recognizer):
 
     assert got is True
     assert p.last_rec_names == ["newest"]
+
+
+# ── capture_enroll_candidate — sharpness gate ──────────────────────────────
+
+def _mk_face_with_landmarks(x, y, w, h):
+    """Face tuple with a plausible 5-point landmark array so the biggest-face
+    picker can index it. Contents don't matter — capture_enroll_candidate
+    doesn't inspect them, it just carries them into the buffer entry."""
+    lm = np.array([[x + w * 0.35, y + h * 0.40],
+                   [x + w * 0.65, y + h * 0.40],
+                   [x + w * 0.50, y + h * 0.55],
+                   [x + w * 0.40, y + h * 0.70],
+                   [x + w * 0.60, y + h * 0.70]], dtype=np.float32)
+    return (x, y, w, h, lm)
+
+
+def test_capture_drops_blurry_frame(perc_no_recognizer):
+    """A uniform-grey face region has Laplacian variance ~= 0 — well
+    below CAPTURE_SHARPNESS_MIN — and must be dropped rather than
+    consuming a slot in the fixed-size candidate deque."""
+    p = perc_no_recognizer
+    p.last_complete_faces = [_mk_face_with_landmarks(10, 10, 60, 60)]
+    flat_frame = np.full((200, 200, 3), 128, dtype=np.uint8)
+
+    assert len(p.enroll_candidates) == 0
+    p.capture_enroll_candidate(flat_frame)
+    assert len(p.enroll_candidates) == 0
+
+
+def test_capture_appends_sharp_frame(perc_no_recognizer):
+    """A high-variance (noise) face region easily clears
+    CAPTURE_SHARPNESS_MIN and lands in the buffer with all metadata."""
+    p = perc_no_recognizer
+    face = _mk_face_with_landmarks(10, 10, 60, 60)
+    p.last_complete_faces = [face]
+    rng = np.random.default_rng(42)
+    sharp_frame = rng.integers(0, 256, size=(200, 200, 3),
+                               dtype=np.uint8).astype(np.uint8)
+
+    p.capture_enroll_candidate(sharp_frame)
+
+    assert len(p.enroll_candidates) == 1
+    entry = p.enroll_candidates[0]
+    assert entry["bbox"] == (10, 10, 60, 60)
+    assert entry["sharpness"] > CAPTURE_SHARPNESS_MIN
+    assert entry["landmarks"] is face[4]
 
 
 # ── Constants sanity ────────────────────────────────────────────────────────

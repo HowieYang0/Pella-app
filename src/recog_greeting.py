@@ -37,6 +37,7 @@ import numpy as np
 import actions
 import greeting
 from perception import Perception
+from stt import tts_mute_until
 from vision import (
     GREET_COOLDOWN, MOTION_COOLDOWN, SEEK_TIMEOUT,
     INTRODUCE_COOLDOWN, SEE_COMPLAINT_COOLDOWN,
@@ -89,7 +90,7 @@ RECOG_TIMEOUT_SEC         = 6.0
 # held throughout RECOGNIZING (recovery queued at exit), these durations
 # target the time before sampling begins — letting the body settle in the
 # seek pose first.
-RECOG_STABILIZE_LOOK_SEC  = 0.5
+RECOG_STABILIZE_LOOK_SEC  = 1.0
 RECOG_STABILIZE_SIT_SEC   = 1.5
 # Face position jitters during pose motion; brief detection misses shouldn't
 # abort the task.
@@ -284,8 +285,16 @@ class RecogGreetingTask:
         # Append face captures to the candidate buffer during enrollment.
         # The best one is picked from the buffer when submit_transcript
         # fires successful enrollment.
+        #
+        # Skip while TTS is playing — Pella's own speech ("Hello, I am
+        # Pella...") drives the recovery action that swings the camera
+        # back to level, and the frames captured through that motion
+        # are the blurriest of the whole INTRODUCING window. The mic is
+        # already muted for the same interval, so this reuses a signal
+        # that's already being maintained.
         if self._enroll_state["active"] and img is not None \
-                and self._perception.last_complete_faces:
+                and self._perception.last_complete_faces \
+                and now >= tts_mute_until[0]:
             self._perception.capture_enroll_candidate(img)
 
         # Pending held transcript expired with no continuation: apologise
