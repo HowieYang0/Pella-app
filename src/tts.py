@@ -26,7 +26,7 @@ from queue import Empty
 from pydub import AudioSegment
 
 import stt
-from stt import TTS_MUTE_SEC, tts_mute_until
+from stt import TTS_MUTE_SEC, tts_mute_until, tts_last_stopped_at
 
 
 # ── Fast AudioHub upload ─────────────────────────────────────────────────────
@@ -153,10 +153,14 @@ MUTE_BUFFER_SEC = 0.4
 # After the rt/audiohub/player/state callback detects the playing -> stopped
 # transition, hold the mic muted for this much longer to absorb (a) the
 # heartbeat-sampling slop (~125 ms avg between actual end and our detection)
-# and (b) the room reverb tail. 100 ms is comfortable for a typical home/
-# office room and well below human reaction time (~200-500 ms) so doesn t
-# eat the start of the user s reply.
-REVERB_PAD_SEC = 0.1
+# and (b) the room reverb tail. Tightened from 100 ms -> 30 ms after
+# observing user-speech overlap losses ("My name is Joy" -> "Joy"): 100 ms
+# combined with the ~125 ms heartbeat delay was cutting off ~200-250 ms
+# of the user s reply. 30 ms is short enough not to eat conversational
+# overlap yet still covers the near-field reverb tail of a small home/
+# office room. If the diagnostic log ("USB mic: opened N ms after TTS end")
+# consistently shows gaps well under 100 ms, further trimming is safe.
+REVERB_PAD_SEC = 0.03
 
 
 # ── rt/audiohub/player/state subscription ────────────────────────────────────
@@ -210,6 +214,9 @@ def make_player_state_callback():
             # ~125 ms heartbeat resolution). Shorten the mute to now +
             # REVERB_PAD_SEC. Never lengthen it.
             now = time.monotonic()
+            # Stamp the TTS-stopped moment so the mic loop can log the
+            # actual mute-to-mic-open gap on the next accepted frame.
+            tts_last_stopped_at[0] = now
             new_deadline = now + REVERB_PAD_SEC
             if new_deadline < tts_mute_until[0]:
                 saved = tts_mute_until[0] - new_deadline

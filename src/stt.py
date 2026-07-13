@@ -124,6 +124,14 @@ USB_PRE_ROLL_FRAMES    = 80      # audio kept before onset (~1.6 s) to capture s
 # Shared mutable: TTS sets this so the USB mic loop mutes itself during playback.
 tts_mute_until = [0.0]
 
+# Shared mutable: TTS sets this to time.monotonic() the moment the audiohub
+# player reports is_playing -> false. The USB mic loop reads it once each
+# time the mute clears to log the actual gap between Pella s speech ending
+# and the mic accepting the first user frame. Used purely for diagnostics —
+# tuning REVERB_PAD_SEC + MUTE_BUFFER_SEC needs a real distribution of
+# session-observed gaps, not just a stopwatch guess.
+tts_last_stopped_at = [0.0]
+
 
 # ── Diagnostic audio-clip dump ────────────────────────────────────────────────
 #
@@ -913,7 +921,17 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
                 break
 
             if time.monotonic() < tts_mute_until[0]:
+                vad["mic_was_muted"] = True
                 continue
+
+            if vad.get("mic_was_muted"):
+                vad["mic_was_muted"] = False
+                stopped = tts_last_stopped_at[0]
+                if stopped > 0.0:
+                    gap_ms = (time.monotonic() - stopped) * 1000.0
+                    print(f"USB mic: opened {gap_ms:.0f} ms after TTS end",
+                          flush=True)
+                    tts_last_stopped_at[0] = 0.0
 
             chunk = np.frombuffer(raw, dtype=np.int16)
             rms   = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
