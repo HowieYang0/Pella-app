@@ -844,6 +844,10 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
     def _flush():
         samples         = np.array(list(vad["buf"]), dtype=np.int16)
         speech_start_t  = vad["speech_start_t"]
+        # Snapshot the noise floor BEFORE clearing state — it isn t updated
+        # during in_speech (only during silence, above), so this value is
+        # the pre-speech ambient at the moment the clip closes.
+        noise_floor     = vad["noise_floor"]
         vad["buf"].clear()
         vad["in_speech"]       = False
         vad["speech_frames"]   = 0
@@ -859,8 +863,19 @@ def run_usb_mic(transcript_queue: Queue, stop_event: threading.Event):
         # * 20ms), but that's fine for the downstream stitch-gap test which
         # uses ~3 s windows.
         speech_end_t = speech_start_t + clip_sec
+        # Loudness diagnostic: log the clip s RMS and peak alongside the
+        # pre-speech noise floor, plus their ratio. A low SNR here (say
+        # < 2-3×) points at "quiet voice near the VAD trigger threshold"
+        # — useful when investigating whether soft-spoken guests are being
+        # missed because their voices barely clear USB_NOISE_FLOOR_FACTOR.
+        # Cost is trivial (one pass over ~6 s of int16 samples per clip).
+        clip_rms  = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        clip_peak = float(np.abs(samples).max())
+        snr       = clip_rms / max(1.0, noise_floor)
         print(f"ASR: sending {clip_sec:.1f}s of audio "
-              f"(speech started {time.monotonic() - speech_start_t:.1f}s ago)",
+              f"(started {time.monotonic() - speech_start_t:.1f}s ago, "
+              f"rms={clip_rms:.0f}, peak={clip_peak:.0f}, "
+              f"floor={noise_floor:.0f}, snr={snr:.1f}x)",
               flush=True)
 
         def _run():
