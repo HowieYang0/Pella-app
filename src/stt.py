@@ -581,6 +581,11 @@ def ensure_noise_profile(read_chunk_fn, sample_rate: int) -> None:
           f"rms={int(rms)}) -> {_NOISE_PROFILE_PATH}", flush=True)
 
 
+# Post-transcription hallucination filter — pure text logic lives in a
+# separate module so its tests don t drag numpy/torch/faster-whisper in.
+from stt_filters import _is_hallucination_only  # noqa: E402
+
+
 # ── Transcription ─────────────────────────────────────────────────────────────
 
 def transcribe(samples: np.ndarray,
@@ -691,15 +696,16 @@ def transcribe(samples: np.ndarray,
                                                    # decodes get rejected
                 log_prob_threshold=-0.7,           # low-confidence decodes
                                                    # get rejected
-                # Language-model hint that biases Whisper toward the name-
-                # introduction patterns we actually listen for, away from
-                # frequent-English hallucinations ("It's Alison" / "Hey
-                # Mr. Ellison" instead of "My name is Alison"). Common
-                # short names anchor the model toward proper-noun
-                # interpretation of similar-sounding tokens.
-                initial_prompt=("Pella, Bella. My name is Alison. "
-                                "My name is William. Call me Sam. "
-                                "I am Joy."),
+                # Neutral prompt: empty on purpose. A previous
+                # name-templated prompt ("My name is Alison. My name
+                # is William. ...") was self-hallucinating — the LM
+                # would output "My name is" from silent clips because
+                # that pattern had been primed as high-probability.
+                # Also over-fitted to the named individuals rather
+                # than generalising to arbitrary guests. Whisper
+                # handles common English + widely-represented
+                # international names well without prompt bias.
+                initial_prompt="",
             )
             parts = [seg.text.strip() for seg in segments
                      if seg.no_speech_prob < NO_SPEECH_THRESHOLD]
@@ -713,7 +719,12 @@ def transcribe(samples: np.ndarray,
             parts = [s["text"].strip() for s in result.get("segments", [])
                      if s.get("no_speech_prob", 0) < NO_SPEECH_THRESHOLD]
 
-        return " ".join(parts).strip()
+        text = " ".join(parts).strip()
+        if text and _is_hallucination_only(text):
+            print(f"ASR: rejecting {text!r} as likely hallucination "
+                  f"(no-name intro or known Whisper artefact)", flush=True)
+            return ""
+        return text
 
     except Exception as e:
         print(f"ASR error: {e}", flush=True)
